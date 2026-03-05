@@ -91,6 +91,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Фінанси Amazon')
     .addItem('Імпорт місячного звіту (останній із папки)', 'uiImportLatestMonthlyVatReport_')
+    .addItem('Імпорт всіх місячних звітів з папки', 'uiImportAllMonthlyVatReportsFromFolder_')
+    .addItem('Повний перерахунок: всі Settlement + всі місячні звіти', 'uiRecalculateAllSettlementsAndMonthlyReports_')
     .addItem('Імпорт Settlement (останній із папки)', 'uiImportLatestFromFolder_')
     .addItem('Імпорт Settlement (вибір зі списку файлів)', 'uiImportChooseFromFolderList_')
     .addItem('Оновити всі Settlement з папки', 'uiImportAllFromFolder_')
@@ -162,6 +164,99 @@ function uiImportLatestMonthlyVatReport_() {
     ui.alert('Помилка імпорту місячного звіту: ' + toErrorMessage_(e));
   }
 }
+
+function uiImportAllMonthlyVatReportsFromFolder_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (!CONFIG.MONTHLY_REPORT_FOLDER_ID) {
+      ui.alert('Не задано CONFIG.MONTHLY_REPORT_FOLDER_ID');
+      return;
+    }
+
+    const candidates = getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+    if (!candidates.length) {
+      ui.alert('У папці не знайдено TXT/TSV/CSV файлів: ' + CONFIG.MONTHLY_REPORT_FOLDER_ID);
+      return;
+    }
+
+    const confirm = ui.alert(
+      'Підтвердження імпорту місячних звітів',
+      ['Знайдено файлів: ' + candidates.length, 'Перерахувати всі місячні звіти?'].join('\n'),
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (confirm !== ui.Button.OK) return;
+
+    const result = importAllMonthlyVatReportsFromFolder_({ candidates: candidates, resetSheet: true, progressEvery: 10 });
+    const lines = [
+      'Знайдено файлів: ' + result.total,
+      'Успішно оброблено: ' + result.imported,
+      'Оновлено місяців: ' + result.monthsTouched
+    ];
+    if (result.failed > 0) {
+      lines.push('Помилки: ' + result.failed);
+      const shown = result.errors.slice(0, 10);
+      for (let i = 0; i < shown.length; i++) lines.push('- ' + shown[i]);
+      if (result.errors.length > shown.length) lines.push('... ще ' + (result.errors.length - shown.length) + ' помилок.');
+    }
+
+    ui.alert('Імпорт усіх місячних звітів завершено', lines.join('\n'), ui.ButtonSet.OK);
+  } catch (e) {
+    handleFatal_('uiImportAllMonthlyVatReportsFromFolder_', e);
+    ui.alert('Помилка масового імпорту місячних звітів: ' + toErrorMessage_(e));
+  }
+}
+
+function uiRecalculateAllSettlementsAndMonthlyReports_() {
+  const ui = SpreadsheetApp.getUi();
+  const warnings = [];
+  try {
+    validateSummarySheet_();
+
+    const settlementCandidates = getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+    const monthlyCandidates = getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+
+    const confirm = ui.alert(
+      'Повний перерахунок',
+      [
+        'Settlement файлів: ' + settlementCandidates.length,
+        'Місячних звітів: ' + monthlyCandidates.length,
+        'Запустити ПОВНИЙ перерахунок всіх даних?'
+      ].join('\n'),
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (confirm !== ui.Button.OK) return;
+
+    const settlements = importAllSettlementsFromFolder_({
+      warnings: warnings,
+      candidates: settlementCandidates,
+      progressEvery: 10,
+      rebuildEvery: 10,
+      forceReimport: true
+    });
+
+    const monthly = importAllMonthlyVatReportsFromFolder_({
+      candidates: monthlyCandidates,
+      resetSheet: true,
+      progressEvery: 10
+    });
+
+    const lines = [
+      'Settlement: ' + settlements.imported + '/' + settlements.total,
+      'Monthly reports: ' + monthly.imported + '/' + monthly.total,
+      'Оновлено місяців у ПДВ звіті: ' + monthly.monthsTouched
+    ];
+    if (settlements.failed > 0 || monthly.failed > 0) {
+      lines.push('Помилки settlement: ' + settlements.failed);
+      lines.push('Помилки monthly: ' + monthly.failed);
+    }
+
+    ui.alert(buildUiResultMessage_('Повний перерахунок завершено.', lines.join('\n'), warnings));
+  } catch (e) {
+    handleFatal_('uiRecalculateAllSettlementsAndMonthlyReports_', e);
+    ui.alert(buildUiResultMessage_('Повний перерахунок завершився з помилкою.', '', warnings, [toErrorMessage_(e)]));
+  }
+}
+
 
 function uiImportChooseFromFolderList_() {
   const ui = SpreadsheetApp.getUi();
@@ -348,6 +443,94 @@ function getSettlementFileCandidatesFromFolder_(folderId, limit) {
   return out.slice(0, Math.max(1, Number(limit) || CONFIG.FOLDER_LIST_LIMIT));
 }
 
+
+
+function getMonthlyReportFileCandidatesFromFolder_(folderId, limit) {
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFiles();
+  const out = [];
+
+  while (files.hasNext()) {
+    const f = files.next();
+    const name = String(f.getName() || '');
+    const lname = name.toLowerCase();
+    const mime = String(f.getMimeType() || '').toLowerCase();
+
+    const mimeOk = mime === 'text/plain' || mime === 'application/octet-stream' || mime === 'text/tab-separated-values' || mime === 'text/csv' || mime === 'application/vnd.ms-excel';
+    const nameOk = /\.(txt|tsv|csv)$/i.test(name) || lname.indexOf('vat') !== -1 || lname.indexOf('report') !== -1;
+    if (!mimeOk && !nameOk) continue;
+
+    out.push({
+      id: f.getId(),
+      name: name,
+      mimeType: f.getMimeType(),
+      size: Number(f.getSize() || 0),
+      updatedAt: f.getLastUpdated(),
+      createdAt: f.getDateCreated()
+    });
+  }
+
+  out.sort(function(a, b) {
+    const ta = (a.updatedAt && a.updatedAt.getTime()) || (a.createdAt && a.createdAt.getTime()) || 0;
+    const tb = (b.updatedAt && b.updatedAt.getTime()) || (b.createdAt && b.createdAt.getTime()) || 0;
+    return tb - ta;
+  });
+
+  return out.slice(0, Math.max(1, Number(limit) || CONFIG.FOLDER_LIST_LIMIT));
+}
+
+function importAllMonthlyVatReportsFromFolder_(options) {
+  options = options || {};
+  const candidates = Array.isArray(options.candidates)
+    ? options.candidates
+    : getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+
+  if (!candidates.length) return { total: 0, imported: 0, failed: 0, monthsTouched: 0, errors: [] };
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.MONTHLY_REPORT_SHEET) || ss.insertSheet(CONFIG.MONTHLY_REPORT_SHEET);
+  if (options.resetSheet) {
+    const headers = ['Month', 'Sales Total', 'VAT To Pay', 'Rows', 'Файл', 'File ID', 'Імпортовано'];
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  const progressEvery = Math.max(1, Number(options.progressEvery) || 0);
+  const errors = [];
+  const months = Object.create(null);
+  let imported = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const f = candidates[i];
+    try {
+      const res = importMonthlyVatReportFile_(f.id);
+      months[res.monthLabel] = true;
+      imported++;
+    } catch (e) {
+      const emsg = '[' + f.name + '] ' + toErrorMessage_(e);
+      errors.push(emsg);
+      Logger.log('[MONTHLY VAT BULK ERROR] ' + emsg);
+    }
+
+    if (progressEvery > 0 && ((i + 1) % progressEvery === 0 || i === candidates.length - 1)) {
+      safeToast_('Monthly VAT bulk update: ' + (i + 1) + '/' + candidates.length);
+    }
+  }
+
+  if (sheet.getLastRow() > 1) {
+    safeSetNumberFormat_(sheet.getRange(2, 1, sheet.getLastRow() - 1, 1), 'yyyy-MM', [], 'monthlyVat.month.bulk');
+    safeSetNumberFormat_(sheet.getRange(2, 2, sheet.getLastRow() - 1, 2), '#,##0.00', [], 'monthlyVat.money.bulk');
+  }
+
+  return {
+    total: candidates.length,
+    imported: imported,
+    failed: errors.length,
+    monthsTouched: Object.keys(months).length,
+    errors: errors
+  };
+}
+
 function importAllSettlementsFromFolder_(options) {
   options = options || {};
   const warnings = Array.isArray(options.warnings) ? options.warnings : [];
@@ -386,7 +569,8 @@ function importAllSettlementsFromFolder_(options) {
     try {
       importSettlementTxtFile_(fileMeta.id, {
         warnings: warnings,
-        skipPostImportRebuild: true
+        skipPostImportRebuild: true,
+        forceReimport: !!options.forceReimport
       });
       imported++;
       importedSinceRebuild++;
