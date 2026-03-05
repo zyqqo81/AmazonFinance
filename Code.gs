@@ -15,6 +15,14 @@ const CONFIG = {
   MONTHLY_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   MONTHLY_REPORT_SHEET: 'ПДВ ЗВІТ',
 
+  TAX_REPORT_FOLDER_ID: '',
+  TAX_RAW_SHEET: 'TAX_REPORT_RAW',
+  VAT_SUMMARY_SHEET: 'VAT_SALES_SUMMARY',
+  VAT_PIVOT_SHEET: 'VAT_PIVOT',
+  DEFAULT_GROUP_DATE_FIELD: 'Tax Calculation Date',
+  ALT_GROUP_DATE_FIELD: 'Order Date',
+  CURRENCY: 'EUR',
+
   AUDIT: {
     ENABLED: true,
     FOLDER_ID: '1ALCVcKM_3QlEeCedr6DE1YNOI5HKzE2s',
@@ -102,6 +110,12 @@ function onOpen() {
     .addSeparator()
     .addItem('Перебудувати місячну агрегацію', 'rebuildMonthly_')
     .addItem('Перевірити заголовки', 'validateSummarySheet_')
+    .addSeparator()
+    .addItem('Імпорт Tax Report (CSV) — з Drive File ID', 'uiImportTaxReportByFileId_')
+    .addItem('Імпорт Tax Report (CSV) — останній з папки', 'uiImportTaxReportLatestFromFolder_')
+    .addItem('Побудувати VAT/Sales зведення', 'uiBuildVatSalesSummary_')
+    .addItem('Побудувати VAT/Sales зведення (за Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
+    .addItem('Діагностика: перевірити заголовки Tax Report', 'uiValidateTaxReportHeaders_')
     .addToUi();
 }
 
@@ -2358,7 +2372,7 @@ function runNonCritical_(label, fn, warnings) {
 
 function safeToast_(msg) {
   try {
-    SpreadsheetApp.getActive().toast(String(msg || ''), 'Amazon Finance', 8);
+    SpreadsheetApp.getActive().toast(String(msg || ''), 'Фінанси Amazon', 8);
   } catch (e) {
     Logger.log('[TOAST WARN] ' + toErrorMessage_(e));
   }
@@ -2373,4 +2387,485 @@ function handleFatal_(where, e) {
   const msg = '[' + where + '] ' + toErrorMessage_(e);
   Logger.log(msg + '\n' + (e && e.stack ? e.stack : ''));
   safeToast_(msg);
+}
+
+
+/* =========================
+ * VAT / SALES FROM AMAZON TAX REPORT
+ * ========================= */
+
+const TAX_REQUIRED_HEADERS = [
+  'Order Date',
+  'Order ID',
+  'Transaction Type',
+  'Quantity',
+  'Tax Calculation Date',
+  'Tax Rate',
+  'Tax Collection Responsibility',
+  'Ship To Country',
+  'OUR_PRICE Tax Inclusive Selling Price',
+  'OUR_PRICE Tax Amount',
+  'OUR_PRICE Tax Exclusive Selling Price',
+  'OUR_PRICE Tax Inclusive Promo Amount',
+  'OUR_PRICE Tax Amount Promo',
+  'OUR_PRICE Tax Exclusive Promo Amount',
+  'SHIPPING Tax Inclusive Selling Price',
+  'SHIPPING Tax Amount',
+  'SHIPPING Tax Exclusive Selling Price',
+  'SHIPPING Tax Inclusive Promo Amount',
+  'SHIPPING Tax Amount Promo',
+  'SHIPPING Tax Exclusive Promo Amount',
+  'GIFTWRAP Tax Inclusive Selling Price',
+  'GIFTWRAP Tax Amount',
+  'GIFTWRAP Tax Exclusive Selling Price',
+  'GIFTWRAP Tax Inclusive Promo Amount',
+  'GIFTWRAP Tax Amount Promo',
+  'GIFTWRAP Tax Exclusive Promo Amount'
+];
+
+const TAX_COMPUTED_HEADERS = [
+  'Period (YYYY-MM)',
+  'Net Product',
+  'VAT Product',
+  'Gross Product',
+  'Net Shipping',
+  'VAT Shipping',
+  'Gross Shipping',
+  'Net Giftwrap',
+  'VAT Giftwrap',
+  'Gross Giftwrap',
+  'Net Total',
+  'VAT Total',
+  'Gross Total'
+];
+
+const VAT_SUMMARY_HEADERS = [
+  'Period (YYYY-MM)',
+  'Ship To Country',
+  'Tax Rate',
+  'Tax Collection Responsibility',
+  'Transaction Type',
+  'Orders (distinct Order ID count)',
+  'Units (sum Quantity)',
+  'Net Sales (Total)',
+  'VAT (Total)',
+  'Gross Sales (Total)',
+  'Net Product',
+  'VAT Product',
+  'Net Shipping',
+  'VAT Shipping',
+  'Net Giftwrap',
+  'VAT Giftwrap',
+  'Notes'
+];
+
+function uiImportTaxReportByFileId_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const prompt = ui.prompt('Імпорт Tax Report (CSV) — з Drive File ID', 'Введіть Google Drive File ID:', ui.ButtonSet.OK_CANCEL);
+    if (prompt.getSelectedButton() !== ui.Button.OK) return;
+    const fileId = String(prompt.getResponseText() || '').trim();
+    if (!fileId) {
+      ui.alert('File ID порожній. Імпорт скасовано.');
+      return;
+    }
+    const result = importTaxReportCsvFromFileId_(fileId, CONFIG.DEFAULT_GROUP_DATE_FIELD);
+    ui.alert('Імпорт Tax Report завершено.\nІмпортовано рядків: ' + result.rows + '\nАркуш: ' + CONFIG.TAX_RAW_SHEET);
+  } catch (e) {
+    ui.alert('Помилка імпорту Tax Report: ' + toErrorMessage_(e));
+  }
+}
+
+function uiImportTaxReportLatestFromFolder_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (!CONFIG.TAX_REPORT_FOLDER_ID) {
+      ui.alert('CONFIG.TAX_REPORT_FOLDER_ID порожній. Спочатку вкажіть ID папки.');
+      return;
+    }
+    const files = getTaxCsvCandidatesFromFolder_(CONFIG.TAX_REPORT_FOLDER_ID, 1);
+    if (!files.length) {
+      ui.alert('У папці не знайдено CSV файлів: ' + CONFIG.TAX_REPORT_FOLDER_ID);
+      return;
+    }
+    const result = importTaxReportCsvFromFileId_(files[0].id, CONFIG.DEFAULT_GROUP_DATE_FIELD);
+    ui.alert('Імпортовано останній Tax Report: ' + files[0].name + '\nРядків: ' + result.rows);
+  } catch (e) {
+    ui.alert('Помилка імпорту останнього Tax Report: ' + toErrorMessage_(e));
+  }
+}
+
+function uiBuildVatSalesSummary_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = buildVatSalesSummary_(CONFIG.DEFAULT_GROUP_DATE_FIELD);
+    ui.alert('VAT/Sales зведення побудовано.\nРядків: ' + res.rows + '\nVAT до сплати (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT зібрано Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
+  } catch (e) {
+    ui.alert('Помилка побудови VAT/Sales зведення: ' + toErrorMessage_(e));
+  }
+}
+
+function uiBuildVatSalesSummaryByOrderDate_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = buildVatSalesSummary_(CONFIG.ALT_GROUP_DATE_FIELD);
+    ui.alert('VAT/Sales зведення (Order Date) побудовано.\nРядків: ' + res.rows + '\nVAT до сплати (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT зібрано Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
+  } catch (e) {
+    ui.alert('Помилка побудови VAT/Sales зведення за Order Date: ' + toErrorMessage_(e));
+  }
+}
+
+function uiValidateTaxReportHeaders_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const report = validateTaxReportHeaders_();
+    ui.alert(report);
+  } catch (e) {
+    ui.alert('Помилка діагностики: ' + toErrorMessage_(e));
+  }
+}
+
+function importTaxReportCsvFromFileId_(fileId, groupDateField) {
+  const file = DriveApp.getFileById(fileId);
+  const text = file.getBlob().getDataAsString();
+  const csv = Utilities.parseCsv(text, ',');
+  if (!csv || csv.length < 2) throw new Error('CSV has no data rows.');
+
+  const headers = (csv[0] || []).map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const missing = findMissingHeaders_(hm, TAX_REQUIRED_HEADERS);
+  if (missing.length) throw new Error('Missing required headers: ' + missing.join(', '));
+
+  const dateField = normalizeHeaderKey_(groupDateField) === normalizeHeaderKey_(CONFIG.ALT_GROUP_DATE_FIELD)
+    ? CONFIG.ALT_GROUP_DATE_FIELD
+    : CONFIG.DEFAULT_GROUP_DATE_FIELD;
+
+  const rawRows = [];
+  for (let i = 1; i < csv.length; i++) {
+    const row = csv[i];
+    if (!row || isEmptyRow_(row)) continue;
+    const ext = buildTaxComputedColumns_(headers, row, dateField);
+    rawRows.push(headers.map(function(_, idx) { return row[idx] !== undefined ? row[idx] : ''; }).concat(ext));
+  }
+
+  const sheet = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
+  sheet.clearContents();
+  const finalHeaders = headers.concat(TAX_COMPUTED_HEADERS);
+  sheet.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
+  if (rawRows.length) sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
+  return { rows: rawRows.length };
+}
+
+function buildTaxComputedColumns_(headers, row, groupDateField) {
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  function n(name) {
+    const idx = hm[normalizeHeaderKey_(name)];
+    return parseNumberFlexible_(idx === undefined ? '' : row[idx]);
+  }
+
+  const periodDate = parseAmazonUtcDate_(valueByHeader_(row, hm, groupDateField));
+  const period = periodDate ? Utilities.formatDate(periodDate, CONFIG.TZ, 'yyyy-MM') : '';
+
+  const netProduct = n('OUR_PRICE Tax Exclusive Selling Price') - n('OUR_PRICE Tax Exclusive Promo Amount');
+  const vatProduct = n('OUR_PRICE Tax Amount') - n('OUR_PRICE Tax Amount Promo');
+  const grossProduct = n('OUR_PRICE Tax Inclusive Selling Price') - n('OUR_PRICE Tax Inclusive Promo Amount');
+
+  const netShipping = n('SHIPPING Tax Exclusive Selling Price') - n('SHIPPING Tax Exclusive Promo Amount');
+  const vatShipping = n('SHIPPING Tax Amount') - n('SHIPPING Tax Amount Promo');
+  const grossShipping = n('SHIPPING Tax Inclusive Selling Price') - n('SHIPPING Tax Inclusive Promo Amount');
+
+  const netGiftwrap = n('GIFTWRAP Tax Exclusive Selling Price') - n('GIFTWRAP Tax Exclusive Promo Amount');
+  const vatGiftwrap = n('GIFTWRAP Tax Amount') - n('GIFTWRAP Tax Amount Promo');
+  const grossGiftwrap = n('GIFTWRAP Tax Inclusive Selling Price') - n('GIFTWRAP Tax Inclusive Promo Amount');
+
+  const netTotal = netProduct + netShipping + netGiftwrap;
+  const vatTotal = vatProduct + vatShipping + vatGiftwrap;
+  const grossTotal = grossProduct + grossShipping + grossGiftwrap;
+
+  return [
+    period,
+    netProduct, vatProduct, grossProduct,
+    netShipping, vatShipping, grossShipping,
+    netGiftwrap, vatGiftwrap, grossGiftwrap,
+    netTotal, vatTotal, grossTotal
+  ];
+}
+
+function buildVatSalesSummary_(groupDateField) {
+  const raw = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
+  const lastRow = raw.getLastRow();
+  const lastCol = raw.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) throw new Error('TAX_REPORT_RAW is empty. Import CSV first.');
+
+  const all = raw.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+
+  const requiredRaw = [
+    'Order ID', 'Quantity', 'Tax Rate', 'Ship To Country', 'Tax Collection Responsibility', 'Transaction Type',
+    'Net Total', 'VAT Total', 'Gross Total', 'Net Product', 'VAT Product', 'Net Shipping', 'VAT Shipping', 'Net Giftwrap', 'VAT Giftwrap',
+    CONFIG.DEFAULT_GROUP_DATE_FIELD, CONFIG.ALT_GROUP_DATE_FIELD
+  ];
+  const missing = findMissingHeaders_(hm, requiredRaw);
+  if (missing.length) throw new Error('Missing columns in TAX_REPORT_RAW: ' + missing.join(', '));
+
+  const useDateField = normalizeHeaderKey_(groupDateField) === normalizeHeaderKey_(CONFIG.ALT_GROUP_DATE_FIELD)
+    ? CONFIG.ALT_GROUP_DATE_FIELD
+    : CONFIG.DEFAULT_GROUP_DATE_FIELD;
+
+  const grouped = {};
+  const uniqResponsibility = {};
+  for (let i = 1; i < all.length; i++) {
+    const row = all[i];
+    if (isEmptyRow_(row)) continue;
+
+    const d = parseAmazonUtcDate_(valueByHeader_(row, hm, useDateField));
+    const period = d ? Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM') : '';
+    const shipToCountry = String(valueByHeader_(row, hm, 'Ship To Country') || '').trim();
+    const taxRate = parseNumberFlexible_(valueByHeader_(row, hm, 'Tax Rate'));
+    const responsibilityRaw = String(valueByHeader_(row, hm, 'Tax Collection Responsibility') || '').trim();
+    const responsibilityNorm = responsibilityRaw.toLowerCase();
+    uniqResponsibility[responsibilityNorm || '(empty)'] = responsibilityRaw || '(empty)';
+    const transactionType = String(valueByHeader_(row, hm, 'Transaction Type') || '').trim() || 'ALL';
+
+    const key = [period, shipToCountry, taxRate.toFixed(6), responsibilityNorm, transactionType].join('||');
+    if (!grouped[key]) {
+      grouped[key] = {
+        period: period,
+        shipToCountry: shipToCountry,
+        taxRate: taxRate,
+        responsibility: responsibilityRaw,
+        transactionType: transactionType,
+        orderIds: {},
+        units: 0,
+        netTotal: 0,
+        vatTotal: 0,
+        grossTotal: 0,
+        netProduct: 0,
+        vatProduct: 0,
+        netShipping: 0,
+        vatShipping: 0,
+        netGiftwrap: 0,
+        vatGiftwrap: 0
+      };
+    }
+
+    const g = grouped[key];
+    const orderId = String(valueByHeader_(row, hm, 'Order ID') || '').trim();
+    if (orderId) g.orderIds[orderId] = true;
+    g.units += parseNumberFlexible_(valueByHeader_(row, hm, 'Quantity'));
+    g.netTotal += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Total'));
+    g.vatTotal += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Total'));
+    g.grossTotal += parseNumberFlexible_(valueByHeader_(row, hm, 'Gross Total'));
+    g.netProduct += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Product'));
+    g.vatProduct += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Product'));
+    g.netShipping += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Shipping'));
+    g.vatShipping += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Shipping'));
+    g.netGiftwrap += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Giftwrap'));
+    g.vatGiftwrap += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Giftwrap'));
+  }
+
+  const keys = Object.keys(grouped).sort();
+  const out = [];
+  let vatPayableSeller = 0;
+  let vatCollectedMarketplace = 0;
+
+  for (let i = 0; i < keys.length; i++) {
+    const g = grouped[keys[i]];
+    const isSeller = String(g.responsibility || '').trim().toLowerCase() === 'seller';
+    if (isSeller) vatPayableSeller += g.vatTotal;
+    else vatCollectedMarketplace += g.vatTotal;
+    out.push([
+      g.period,
+      g.shipToCountry,
+      g.taxRate,
+      g.responsibility,
+      g.transactionType || 'ALL',
+      Object.keys(g.orderIds).length,
+      g.units,
+      g.netTotal,
+      g.vatTotal,
+      g.grossTotal,
+      g.netProduct,
+      g.vatProduct,
+      g.netShipping,
+      g.vatShipping,
+      g.netGiftwrap,
+      g.vatGiftwrap,
+      isSeller ? 'Seller-responsible VAT' : 'Marketplace collected'
+    ]);
+  }
+
+  const summary = getOrCreateSheet_(CONFIG.VAT_SUMMARY_SHEET);
+  summary.clearContents();
+  summary.getRange(1, 1, 1, VAT_SUMMARY_HEADERS.length).setValues([VAT_SUMMARY_HEADERS]);
+  if (out.length) summary.getRange(2, 1, out.length, VAT_SUMMARY_HEADERS.length).setValues(out);
+
+  const metaStart = out.length + 4;
+  const uniqVals = Object.keys(uniqResponsibility).map(function(k) { return uniqResponsibility[k]; }).sort();
+  const meta = [
+    ['Metric', 'Value'],
+    ['Grouping Date Field', useDateField],
+    ['VAT Payable (Seller)', vatPayableSeller],
+    ['VAT Collected by Marketplace/Amazon', vatCollectedMarketplace],
+    ['Unique Tax Collection Responsibility', uniqVals.join(', ')]
+  ];
+  summary.getRange(metaStart, 1, meta.length, 2).setValues(meta);
+
+  applyVatSummaryFormats_(summary, out.length, metaStart + 2);
+
+  return { rows: out.length, vatPayableSeller: vatPayableSeller, vatCollectedMarketplace: vatCollectedMarketplace };
+}
+
+function validateTaxReportHeaders_() {
+  const raw = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
+  const lastRow = raw.getLastRow();
+  const lastCol = raw.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) throw new Error('TAX_REPORT_RAW sheet is empty.');
+
+  const headers = raw.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const missing = findMissingHeaders_(hm, TAX_REQUIRED_HEADERS.concat(TAX_COMPUTED_HEADERS));
+
+  const data = lastRow > 1 ? raw.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
+  const stat = buildTaxDiagnosticsStats_(data, hm);
+
+  const lines = [];
+  lines.push(missing.length ? ('Missing headers: ' + missing.join(', ')) : 'All required headers are present.');
+  lines.push('Rows count: ' + data.length);
+  lines.push('Found headers (first 40): ' + headers.slice(0, 40).join(' | '));
+  lines.push('Order Date min/max: ' + (stat.orderMin || '-') + ' / ' + (stat.orderMax || '-'));
+  lines.push('Tax Calculation Date min/max: ' + (stat.taxMin || '-') + ' / ' + (stat.taxMax || '-'));
+  lines.push('Unique Tax Rate: ' + stat.taxRates.join(', '));
+  lines.push('Unique Tax Collection Responsibility: ' + stat.responsibilities.join(', '));
+  lines.push('Top Ship To Country: ' + stat.shipTop.join(', '));
+
+  return lines.join('\n');
+}
+
+function buildTaxDiagnosticsStats_(rows, hm) {
+  const taxRates = {};
+  const resp = {};
+  const ship = {};
+  let orderMin = null, orderMax = null, taxMin = null, taxMax = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const od = parseAmazonUtcDate_(valueByHeader_(r, hm, 'Order Date'));
+    const td = parseAmazonUtcDate_(valueByHeader_(r, hm, 'Tax Calculation Date'));
+    if (od) { orderMin = !orderMin || od < orderMin ? od : orderMin; orderMax = !orderMax || od > orderMax ? od : orderMax; }
+    if (td) { taxMin = !taxMin || td < taxMin ? td : taxMin; taxMax = !taxMax || td > taxMax ? td : taxMax; }
+
+    taxRates[String(parseNumberFlexible_(valueByHeader_(r, hm, 'Tax Rate')))] = true;
+    const rr = String(valueByHeader_(r, hm, 'Tax Collection Responsibility') || '').trim();
+    if (rr) resp[rr] = true;
+    const c = String(valueByHeader_(r, hm, 'Ship To Country') || '').trim() || '(empty)';
+    ship[c] = (ship[c] || 0) + 1;
+  }
+
+  const shipTop = Object.keys(ship).sort(function(a, b) { return ship[b] - ship[a]; }).slice(0, 10).map(function(c) { return c + ': ' + ship[c]; });
+
+  return {
+    orderMin: orderMin ? Utilities.formatDate(orderMin, CONFIG.TZ, 'yyyy-MM-dd') : '',
+    orderMax: orderMax ? Utilities.formatDate(orderMax, CONFIG.TZ, 'yyyy-MM-dd') : '',
+    taxMin: taxMin ? Utilities.formatDate(taxMin, CONFIG.TZ, 'yyyy-MM-dd') : '',
+    taxMax: taxMax ? Utilities.formatDate(taxMax, CONFIG.TZ, 'yyyy-MM-dd') : '',
+    taxRates: Object.keys(taxRates).sort(),
+    responsibilities: Object.keys(resp).sort(),
+    shipTop: shipTop
+  };
+}
+
+function applyVatSummaryFormats_(sheet, dataRows, metaMoneyRow) {
+  if (!sheet || dataRows <= 0) return;
+  safeSetNumberFormat_(sheet.getRange(2, 3, dataRows, 1), '0.00%');
+  safeSetNumberFormat_(sheet.getRange(2, 6, dataRows, 1), '0');
+  safeSetNumberFormat_(sheet.getRange(2, 7, dataRows, 1), '0');
+  safeSetNumberFormat_(sheet.getRange(2, 8, dataRows, 9), '#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(metaMoneyRow, 2, 2, 1), '#,##0.00');
+}
+
+function getTaxCsvCandidatesFromFolder_(folderId, limit) {
+  const folder = DriveApp.getFolderById(folderId);
+  const it = folder.getFiles();
+  const out = [];
+  while (it.hasNext()) {
+    const f = it.next();
+    const n = String(f.getName() || '').toLowerCase();
+    if (n.endsWith('.csv') || n.indexOf('tax') !== -1) {
+      out.push({ id: f.getId(), name: f.getName(), updated: f.getLastUpdated() });
+    }
+  }
+  out.sort(function(a, b) { return b.updated.getTime() - a.updated.getTime(); });
+  return out.slice(0, Math.max(0, limit || 1));
+}
+
+function getOrCreateSheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+function buildHeaderMapCaseInsensitive_(headers) {
+  const hm = {};
+  for (let i = 0; i < headers.length; i++) hm[normalizeHeaderKey_(headers[i])] = i;
+  return hm;
+}
+
+function normalizeHeaderKey_(s) {
+  return String(s || '').trim().toLowerCase();
+}
+
+function findMissingHeaders_(hm, required) {
+  const missing = [];
+  for (let i = 0; i < required.length; i++) {
+    if (hm[normalizeHeaderKey_(required[i])] === undefined) missing.push(required[i]);
+  }
+  return missing;
+}
+
+function valueByHeader_(row, hm, header) {
+  const idx = hm[normalizeHeaderKey_(header)];
+  return idx === undefined ? '' : row[idx];
+}
+
+function parseNumberFlexible_(value) {
+  if (value === null || value === undefined || value === '') return 0;
+  if (typeof value === 'number') return isFinite(value) ? value : 0;
+  let s = String(value).trim();
+  if (!s) return 0;
+  s = s.replace(/\s/g, '');
+  const hasComma = s.indexOf(',') >= 0;
+  const hasDot = s.indexOf('.') >= 0;
+  if (hasComma && hasDot) {
+    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\./g, '').replace(',', '.');
+    else s = s.replace(/,/g, '');
+  } else if (hasComma) {
+    s = s.replace(',', '.');
+  }
+  const n = Number(s);
+  return isFinite(n) ? n : 0;
+}
+
+function parseAmazonUtcDate_(s) {
+  if (!s && s !== 0) return null;
+  let v = String(s).trim();
+  if (!v) return null;
+  v = v.replace(/\s+UTC$/i, '').trim();
+  const m = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (!m) return null;
+  const day = Number(m[1]);
+  const monTxt = m[2].toLowerCase();
+  const year = Number(m[3]);
+  const mons = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+  if (mons[monTxt] === undefined) return null;
+  return new Date(Date.UTC(year, mons[monTxt], day));
+}
+
+function isEmptyRow_(row) {
+  for (let i = 0; i < row.length; i++) {
+    if (String(row[i] || '').trim() !== '') return false;
+  }
+  return true;
 }
