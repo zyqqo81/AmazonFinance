@@ -11,6 +11,7 @@ const CONFIG = {
   TOTAL_FILE_ID: '__TOTAL__',
   SETTLEMENT_FOLDER_ID: '1K9AuTAmNr5AXHmlTuOIlUdYDRKlKrOAj',
   FOLDER_LIST_LIMIT: 15,
+  BULK_IMPORT_CONFIRM_LIMIT: 200,
 
   AUDIT: {
     ENABLED: true,
@@ -184,7 +185,25 @@ function uiImportAllFromFolder_() {
   const warnings = [];
   try {
     validateSummarySheet_();
-    const result = importAllSettlementsFromFolder_({ warnings: warnings });
+
+    const candidates = getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+    if (!candidates.length) {
+      ui.alert('Не знайдено settlement-файлів у папці: ' + CONFIG.SETTLEMENT_FOLDER_ID);
+      return;
+    }
+
+    const question = [
+      'Знайдено файлів для оновлення: ' + candidates.length,
+      'Продовжити масове оновлення всіх settlement?'
+    ].join('\n');
+    const confirm = ui.alert('Підтвердження масового оновлення', question, ui.ButtonSet.OK_CANCEL);
+    if (confirm !== ui.Button.OK) return;
+
+    const result = importAllSettlementsFromFolder_({
+      warnings: warnings,
+      candidates: candidates,
+      progressEvery: 10
+    });
 
     const lines = [
       'Знайдено файлів: ' + result.total,
@@ -293,13 +312,35 @@ function getSettlementFileCandidatesFromFolder_(folderId, limit) {
 function importAllSettlementsFromFolder_(options) {
   options = options || {};
   const warnings = Array.isArray(options.warnings) ? options.warnings : [];
-  const candidates = getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+  const candidates = Array.isArray(options.candidates)
+    ? options.candidates
+    : getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
   if (!candidates.length) {
     return { total: 0, imported: 0, failed: 0, errors: [] };
   }
 
+  if (candidates.length > CONFIG.BULK_IMPORT_CONFIRM_LIMIT) {
+    warnings.push(
+      'Великий обсяг імпорту (' + candidates.length + ' файлів). Apps Script може зупинити виконання через time limit.'
+    );
+  }
+
   const errors = [];
   let imported = 0;
+  const progressEvery = Math.max(1, Number(options.progressEvery) || 0);
+  const rebuildEvery = Math.max(1, Number(options.rebuildEvery) || progressEvery || 10);
+  let importedSinceRebuild = 0;
+
+  function runBulkCheckpointRebuild_(reason) {
+    if (importedSinceRebuild < 1) return;
+    runNonCritical_('ensureMonthAndTotals_ [' + reason + ']', function() {
+      ensureMonthAndTotals_(warnings);
+    }, warnings);
+    runNonCritical_('rebuildMonthly_ [' + reason + ']', function() {
+      rebuildMonthly_(warnings);
+    }, warnings);
+    importedSinceRebuild = 0;
+  }
 
   for (let i = 0; i < candidates.length; i++) {
     const fileMeta = candidates[i];
@@ -309,19 +350,23 @@ function importAllSettlementsFromFolder_(options) {
         skipPostImportRebuild: true
       });
       imported++;
+      importedSinceRebuild++;
     } catch (e) {
       const emsg = '[' + fileMeta.name + '] ' + toErrorMessage_(e);
       errors.push(emsg);
       Logger.log('[BULK IMPORT ERROR] ' + emsg);
     }
+
+    if ((i + 1) % rebuildEvery === 0) {
+      runBulkCheckpointRebuild_('checkpoint ' + (i + 1) + '/' + candidates.length);
+    }
+
+    if (progressEvery > 0 && ((i + 1) % progressEvery === 0 || i === candidates.length - 1)) {
+      safeToast_('Settlement bulk update: ' + (i + 1) + '/' + candidates.length);
+    }
   }
 
-  runNonCritical_('ensureMonthAndTotals_', function() {
-    ensureMonthAndTotals_(warnings);
-  }, warnings);
-  runNonCritical_('rebuildMonthly_', function() {
-    rebuildMonthly_(warnings);
-  }, warnings);
+  runBulkCheckpointRebuild_('final pass');
 
   return {
     total: candidates.length,
