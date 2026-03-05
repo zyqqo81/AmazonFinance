@@ -814,7 +814,9 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
   const transferC = detectTransferC_(dataRows, idx, warnings || []);
   let marketplaceName = cellByHeader_(firstRow, idx, 'marketplace-name');
 
-  const depositDate = parseDateFlexible_(depositDateRaw, CONFIG.TZ);
+  const depositDate = parseDateFlexible_(depositDateRaw, CONFIG.TZ, {
+    referenceDate: extractDateFromFileName_(fileMeta && fileMeta.name)
+  });
   if (!(depositDate instanceof Date) || isNaN(depositDate.getTime())) {
     throw buildFileDiagnosticError_('Не вдалося розпізнати Deposit Date: "' + depositDateRaw + '"', fileMeta, content, header, [
       'Підтримуються формати: YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, з часом/таймзоною.'
@@ -1929,12 +1931,14 @@ function parseNumberLoose_(s) {
   return isNaN(n) ? 0 : n;
 }
 
-function parseDateFlexible_(value, tz) {
+function parseDateFlexible_(value, tz, options) {
+  options = options || {};
+  const referenceDate = options.referenceDate instanceof Date && !isNaN(options.referenceDate.getTime())
+    ? options.referenceDate
+    : null;
+
   const raw = String(value || '').trim();
   if (!raw) return null;
-
-  const direct = new Date(raw);
-  if (!isNaN(direct.getTime())) return direct;
 
   let m = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?(?:\s*(Z|UTC|[+-]\d{2}:?\d{2})?)?$/i);
   if (m) {
@@ -1945,14 +1949,47 @@ function parseDateFlexible_(value, tz) {
   m = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?$/);
   if (m) {
     const a=Number(m[1]), b=Number(m[2]), y=Number(m[3]), hh=Number(m[4]||0), mm=Number(m[5]||0), ss=Number(m[6]||0);
-    const dayFirst = a > 12 || (a <= 12 && b <= 12);
-    const d = dayFirst ? a : b;
-    const mo = (dayFirst ? b : a) - 1;
-    return new Date(Date.UTC(y, mo, d, hh, mm, ss));
+    if (a > 12) return new Date(Date.UTC(y, b - 1, a, hh, mm, ss));
+    if (b > 12) return new Date(Date.UTC(y, a - 1, b, hh, mm, ss));
+
+    const dmy = new Date(Date.UTC(y, b - 1, a, hh, mm, ss));
+    const mdy = new Date(Date.UTC(y, a - 1, b, hh, mm, ss));
+    return chooseDateByReference_(dmy, mdy, referenceDate) || dmy;
   }
 
   m = raw.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?(?:\s*UTC)?$/i);
   if (m) return new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4]||0), Number(m[5]||0), Number(m[6]||0)));
+
+  const direct = new Date(raw);
+  if (!isNaN(direct.getTime())) return direct;
+
+  return null;
+}
+
+function chooseDateByReference_(a, b, referenceDate) {
+  if (!(a instanceof Date) || isNaN(a.getTime())) return b;
+  if (!(b instanceof Date) || isNaN(b.getTime())) return a;
+  if (!(referenceDate instanceof Date) || isNaN(referenceDate.getTime())) return a;
+
+  const diffA = Math.abs(a.getTime() - referenceDate.getTime());
+  const diffB = Math.abs(b.getTime() - referenceDate.getTime());
+  return diffA <= diffB ? a : b;
+}
+
+function extractDateFromFileName_(fileName) {
+  const name = String(fileName || '');
+  let m = name.match(/(\d{2})_(\d{2})_(\d{4})/);
+  if (m) {
+    const d = Number(m[1]);
+    const mo = Number(m[2]) - 1;
+    const y = Number(m[3]);
+    return new Date(Date.UTC(y, mo, d));
+  }
+
+  m = name.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m) {
+    return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  }
 
   return null;
 }
