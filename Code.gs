@@ -110,6 +110,12 @@ function onOpen() {
     .addSeparator()
     .addItem('Перебудувати місячну агрегацію', 'rebuildMonthly_')
     .addItem('Перевірити заголовки', 'validateSummarySheet_')
+    .addSeparator()
+    .addItem('Import Tax Report (CSV) — from Drive File ID', 'uiImportTaxReportByFileId_')
+    .addItem('Import Tax Report (CSV) — latest from folder', 'uiImportTaxReportLatestFromFolder_')
+    .addItem('Build VAT/Sales Summary', 'uiBuildVatSalesSummary_')
+    .addItem('Build VAT/Sales Summary (by Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
+    .addItem('Diagnostics: Validate Tax Report Headers', 'uiValidateTaxReportHeaders_')
     .addToUi();
 
   SpreadsheetApp.getUi()
