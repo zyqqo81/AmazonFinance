@@ -89,6 +89,7 @@ function onOpen() {
     .createMenu('Фінанси Amazon')
     .addItem('Імпорт Settlement (останній із папки)', 'uiImportLatestFromFolder_')
     .addItem('Імпорт Settlement (вибір зі списку файлів)', 'uiImportChooseFromFolderList_')
+    .addItem('Оновити всі Settlement з папки', 'uiImportAllFromFolder_')
     .addItem('Створити/оновити аудит для вибраного рядка', 'uiCreateAuditForSelectedRow_')
     .addItem('Імпорт Settlement (TSV)', 'uiImportByFileId_')
     .addItem('Налагодження аудиту для вибраного рядка', 'uiDebugAuditForSelectedRow_')
@@ -178,6 +179,36 @@ function uiImportByFileId_() {
   }
 }
 
+function uiImportAllFromFolder_() {
+  const ui = SpreadsheetApp.getUi();
+  const warnings = [];
+  try {
+    validateSummarySheet_();
+    const result = importAllSettlementsFromFolder_({ warnings: warnings });
+
+    const lines = [
+      'Знайдено файлів: ' + result.total,
+      'Успішно оновлено: ' + result.imported
+    ];
+
+    if (result.failed > 0) {
+      lines.push('З помилками: ' + result.failed);
+      const limitedErrors = result.errors.slice(0, 10);
+      for (let i = 0; i < limitedErrors.length; i++) {
+        lines.push('- ' + limitedErrors[i]);
+      }
+      if (result.errors.length > limitedErrors.length) {
+        lines.push('... ще ' + (result.errors.length - limitedErrors.length) + ' помилок. Деталі в Logger.');
+      }
+    }
+
+    ui.alert(buildUiResultMessage_('Масове оновлення settlement завершено.', lines.join('\n'), warnings));
+  } catch (e) {
+    handleFatal_('uiImportAllFromFolder_', e);
+    ui.alert(buildUiResultMessage_('Масове оновлення settlement завершилося з помилкою.', '', warnings, [toErrorMessage_(e)]));
+  }
+}
+
 
 function uiCreateAuditForSelectedRow_() {
   const ui = SpreadsheetApp.getUi();
@@ -259,6 +290,47 @@ function getSettlementFileCandidatesFromFolder_(folderId, limit) {
   return out.slice(0, Math.max(1, Number(limit) || CONFIG.FOLDER_LIST_LIMIT));
 }
 
+function importAllSettlementsFromFolder_(options) {
+  options = options || {};
+  const warnings = Array.isArray(options.warnings) ? options.warnings : [];
+  const candidates = getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+  if (!candidates.length) {
+    return { total: 0, imported: 0, failed: 0, errors: [] };
+  }
+
+  const errors = [];
+  let imported = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const fileMeta = candidates[i];
+    try {
+      importSettlementTxtFile_(fileMeta.id, {
+        warnings: warnings,
+        skipPostImportRebuild: true
+      });
+      imported++;
+    } catch (e) {
+      const emsg = '[' + fileMeta.name + '] ' + toErrorMessage_(e);
+      errors.push(emsg);
+      Logger.log('[BULK IMPORT ERROR] ' + emsg);
+    }
+  }
+
+  runNonCritical_('ensureMonthAndTotals_', function() {
+    ensureMonthAndTotals_(warnings);
+  }, warnings);
+  runNonCritical_('rebuildMonthly_', function() {
+    rebuildMonthly_(warnings);
+  }, warnings);
+
+  return {
+    total: candidates.length,
+    imported: imported,
+    failed: errors.length,
+    errors: errors
+  };
+}
+
 
 /* =========================
  * IMPORT CORE
@@ -324,12 +396,15 @@ function importSettlementTxtFile_(fileId, options) {
     runNonCritical_('applyRowCheckAtRow_', function() {
       applyRowCheckAtRow_(sh, hm, rowIndex);
     }, warnings);
-    runNonCritical_('ensureMonthAndTotals_', function() {
-      ensureMonthAndTotals_(warnings);
-    }, warnings);
-    runNonCritical_('rebuildMonthly_', function() {
-      rebuildMonthly_(warnings);
-    }, warnings);
+
+    if (!options.skipPostImportRebuild) {
+      runNonCritical_('ensureMonthAndTotals_', function() {
+        ensureMonthAndTotals_(warnings);
+      }, warnings);
+      runNonCritical_('rebuildMonthly_', function() {
+        rebuildMonthly_(warnings);
+      }, warnings);
+    }
   }
 
   const msg = [
