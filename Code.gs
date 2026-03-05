@@ -12,6 +12,8 @@ const CONFIG = {
   SETTLEMENT_FOLDER_ID: '1K9AuTAmNr5AXHmlTuOIlUdYDRKlKrOAj',
   FOLDER_LIST_LIMIT: 15,
   BULK_IMPORT_CONFIRM_LIMIT: 200,
+  MONTHLY_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
+  MONTHLY_REPORT_SHEET: 'ПДВ ЗВІТ',
 
   AUDIT: {
     ENABLED: true,
@@ -88,6 +90,9 @@ const CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Фінанси Amazon')
+    .addItem('Імпорт місячного звіту (останній із папки)', 'uiImportLatestMonthlyVatReport_')
+    .addItem('Імпорт всіх місячних звітів з папки', 'uiImportAllMonthlyVatReportsFromFolder_')
+    .addItem('Повний перерахунок: всі Settlement + всі місячні звіти', 'uiRecalculateAllSettlementsAndMonthlyReports_')
     .addItem('Імпорт Settlement (останній із папки)', 'uiImportLatestFromFolder_')
     .addItem('Імпорт Settlement (вибір зі списку файлів)', 'uiImportChooseFromFolderList_')
     .addItem('Оновити всі Settlement з папки', 'uiImportAllFromFolder_')
@@ -123,6 +128,135 @@ function uiImportLatestFromFolder_() {
     ui.alert(buildUiResultMessage_('Імпорт Settlement (latest) завершився з помилкою.', '', warnings, [toErrorMessage_(e)]));
   }
 }
+
+function uiImportLatestMonthlyVatReport_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (!CONFIG.MONTHLY_REPORT_FOLDER_ID || CONFIG.MONTHLY_REPORT_FOLDER_ID === 'PUT_MONTHLY_REPORT_FOLDER_ID_HERE') {
+      ui.alert(
+        'Налаштування не завершено',
+        'Заповніть CONFIG.MONTHLY_REPORT_FOLDER_ID (ID папки Google Drive з місячними Amazon звітами).',
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
+    const candidates = getSettlementFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, 1);
+    if (!candidates.length) {
+      ui.alert('У папці не знайдено TXT/TSV/CSV файлів: ' + CONFIG.MONTHLY_REPORT_FOLDER_ID);
+      return;
+    }
+
+    const latest = candidates[0];
+    const result = importMonthlyVatReportFile_(latest.id);
+    ui.alert(
+      'Місячний звіт оброблено',
+      [
+        'Файл: ' + latest.name,
+        'Період: ' + result.monthLabel,
+        'Сума продажів: ' + result.sales.toFixed(2),
+        'ПДВ до сплати: ' + result.vat.toFixed(2)
+      ].join('\n'),
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    handleFatal_('uiImportLatestMonthlyVatReport_', e);
+    ui.alert('Помилка імпорту місячного звіту: ' + toErrorMessage_(e));
+  }
+}
+
+function uiImportAllMonthlyVatReportsFromFolder_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (!CONFIG.MONTHLY_REPORT_FOLDER_ID) {
+      ui.alert('Не задано CONFIG.MONTHLY_REPORT_FOLDER_ID');
+      return;
+    }
+
+    const candidates = getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+    if (!candidates.length) {
+      ui.alert('У папці не знайдено TXT/TSV/CSV файлів: ' + CONFIG.MONTHLY_REPORT_FOLDER_ID);
+      return;
+    }
+
+    const confirm = ui.alert(
+      'Підтвердження імпорту місячних звітів',
+      ['Знайдено файлів: ' + candidates.length, 'Перерахувати всі місячні звіти?'].join('\n'),
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (confirm !== ui.Button.OK) return;
+
+    const result = importAllMonthlyVatReportsFromFolder_({ candidates: candidates, resetSheet: true, progressEvery: 10 });
+    const lines = [
+      'Знайдено файлів: ' + result.total,
+      'Успішно оброблено: ' + result.imported,
+      'Оновлено місяців: ' + result.monthsTouched
+    ];
+    if (result.failed > 0) {
+      lines.push('Помилки: ' + result.failed);
+      const shown = result.errors.slice(0, 10);
+      for (let i = 0; i < shown.length; i++) lines.push('- ' + shown[i]);
+      if (result.errors.length > shown.length) lines.push('... ще ' + (result.errors.length - shown.length) + ' помилок.');
+    }
+
+    ui.alert('Імпорт усіх місячних звітів завершено', lines.join('\n'), ui.ButtonSet.OK);
+  } catch (e) {
+    handleFatal_('uiImportAllMonthlyVatReportsFromFolder_', e);
+    ui.alert('Помилка масового імпорту місячних звітів: ' + toErrorMessage_(e));
+  }
+}
+
+function uiRecalculateAllSettlementsAndMonthlyReports_() {
+  const ui = SpreadsheetApp.getUi();
+  const warnings = [];
+  try {
+    validateSummarySheet_();
+
+    const settlementCandidates = getSettlementFileCandidatesFromFolder_(CONFIG.SETTLEMENT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+    const monthlyCandidates = getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+
+    const confirm = ui.alert(
+      'Повний перерахунок',
+      [
+        'Settlement файлів: ' + settlementCandidates.length,
+        'Місячних звітів: ' + monthlyCandidates.length,
+        'Запустити ПОВНИЙ перерахунок всіх даних?'
+      ].join('\n'),
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (confirm !== ui.Button.OK) return;
+
+    const settlements = importAllSettlementsFromFolder_({
+      warnings: warnings,
+      candidates: settlementCandidates,
+      progressEvery: 10,
+      rebuildEvery: 10,
+      forceReimport: true
+    });
+
+    const monthly = importAllMonthlyVatReportsFromFolder_({
+      candidates: monthlyCandidates,
+      resetSheet: true,
+      progressEvery: 10
+    });
+
+    const lines = [
+      'Settlement: ' + settlements.imported + '/' + settlements.total,
+      'Monthly reports: ' + monthly.imported + '/' + monthly.total,
+      'Оновлено місяців у ПДВ звіті: ' + monthly.monthsTouched
+    ];
+    if (settlements.failed > 0 || monthly.failed > 0) {
+      lines.push('Помилки settlement: ' + settlements.failed);
+      lines.push('Помилки monthly: ' + monthly.failed);
+    }
+
+    ui.alert(buildUiResultMessage_('Повний перерахунок завершено.', lines.join('\n'), warnings));
+  } catch (e) {
+    handleFatal_('uiRecalculateAllSettlementsAndMonthlyReports_', e);
+    ui.alert(buildUiResultMessage_('Повний перерахунок завершився з помилкою.', '', warnings, [toErrorMessage_(e)]));
+  }
+}
+
 
 function uiImportChooseFromFolderList_() {
   const ui = SpreadsheetApp.getUi();
@@ -309,6 +443,94 @@ function getSettlementFileCandidatesFromFolder_(folderId, limit) {
   return out.slice(0, Math.max(1, Number(limit) || CONFIG.FOLDER_LIST_LIMIT));
 }
 
+
+
+function getMonthlyReportFileCandidatesFromFolder_(folderId, limit) {
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFiles();
+  const out = [];
+
+  while (files.hasNext()) {
+    const f = files.next();
+    const name = String(f.getName() || '');
+    const lname = name.toLowerCase();
+    const mime = String(f.getMimeType() || '').toLowerCase();
+
+    const mimeOk = mime === 'text/plain' || mime === 'application/octet-stream' || mime === 'text/tab-separated-values' || mime === 'text/csv' || mime === 'application/vnd.ms-excel';
+    const nameOk = /\.(txt|tsv|csv)$/i.test(name) || lname.indexOf('vat') !== -1 || lname.indexOf('report') !== -1;
+    if (!mimeOk && !nameOk) continue;
+
+    out.push({
+      id: f.getId(),
+      name: name,
+      mimeType: f.getMimeType(),
+      size: Number(f.getSize() || 0),
+      updatedAt: f.getLastUpdated(),
+      createdAt: f.getDateCreated()
+    });
+  }
+
+  out.sort(function(a, b) {
+    const ta = (a.updatedAt && a.updatedAt.getTime()) || (a.createdAt && a.createdAt.getTime()) || 0;
+    const tb = (b.updatedAt && b.updatedAt.getTime()) || (b.createdAt && b.createdAt.getTime()) || 0;
+    return tb - ta;
+  });
+
+  return out.slice(0, Math.max(1, Number(limit) || CONFIG.FOLDER_LIST_LIMIT));
+}
+
+function importAllMonthlyVatReportsFromFolder_(options) {
+  options = options || {};
+  const candidates = Array.isArray(options.candidates)
+    ? options.candidates
+    : getMonthlyReportFileCandidatesFromFolder_(CONFIG.MONTHLY_REPORT_FOLDER_ID, Number.MAX_SAFE_INTEGER);
+
+  if (!candidates.length) return { total: 0, imported: 0, failed: 0, monthsTouched: 0, errors: [] };
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.MONTHLY_REPORT_SHEET) || ss.insertSheet(CONFIG.MONTHLY_REPORT_SHEET);
+  if (options.resetSheet) {
+    const headers = ['Month', 'Sales Total', 'VAT To Pay', 'Rows', 'Файл', 'File ID', 'Імпортовано'];
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  const progressEvery = Math.max(1, Number(options.progressEvery) || 0);
+  const errors = [];
+  const months = Object.create(null);
+  let imported = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const f = candidates[i];
+    try {
+      const res = importMonthlyVatReportFile_(f.id);
+      months[res.monthLabel] = true;
+      imported++;
+    } catch (e) {
+      const emsg = '[' + f.name + '] ' + toErrorMessage_(e);
+      errors.push(emsg);
+      Logger.log('[MONTHLY VAT BULK ERROR] ' + emsg);
+    }
+
+    if (progressEvery > 0 && ((i + 1) % progressEvery === 0 || i === candidates.length - 1)) {
+      safeToast_('Monthly VAT bulk update: ' + (i + 1) + '/' + candidates.length);
+    }
+  }
+
+  if (sheet.getLastRow() > 1) {
+    safeSetNumberFormat_(sheet.getRange(2, 1, sheet.getLastRow() - 1, 1), 'yyyy-MM', [], 'monthlyVat.month.bulk');
+    safeSetNumberFormat_(sheet.getRange(2, 2, sheet.getLastRow() - 1, 2), '#,##0.00', [], 'monthlyVat.money.bulk');
+  }
+
+  return {
+    total: candidates.length,
+    imported: imported,
+    failed: errors.length,
+    monthsTouched: Object.keys(months).length,
+    errors: errors
+  };
+}
+
 function importAllSettlementsFromFolder_(options) {
   options = options || {};
   const warnings = Array.isArray(options.warnings) ? options.warnings : [];
@@ -347,7 +569,8 @@ function importAllSettlementsFromFolder_(options) {
     try {
       importSettlementTxtFile_(fileMeta.id, {
         warnings: warnings,
-        skipPostImportRebuild: true
+        skipPostImportRebuild: true,
+        forceReimport: !!options.forceReimport
       });
       imported++;
       importedSinceRebuild++;
@@ -471,6 +694,108 @@ function importSettlementTxtFile_(fileId, options) {
   ].join('\n');
 
   return msg;
+}
+
+function importMonthlyVatReportFile_(fileId) {
+  const file = DriveApp.getFileById(fileId);
+  const content = file.getBlob().getDataAsString('UTF-8');
+  const report = parseMonthlyVatReport_(content, file.getName());
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.MONTHLY_REPORT_SHEET) || ss.insertSheet(CONFIG.MONTHLY_REPORT_SHEET);
+  const headers = ['Month', 'Sales Total', 'VAT To Pay', 'Rows', 'Файл', 'File ID', 'Імпортовано'];
+  if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  upsertMonthlyVatRow_(sheet, {
+    monthDate: report.monthDate,
+    sales: report.sales,
+    vat: report.vat,
+    rows: report.rows,
+    fileName: file.getName(),
+    fileId: fileId,
+    importedAt: new Date()
+  });
+
+  if (sheet.getLastRow() > 1) {
+    safeSetNumberFormat_(sheet.getRange(2, 1, sheet.getLastRow() - 1, 1), 'yyyy-MM', [], 'monthlyVat.month');
+    safeSetNumberFormat_(sheet.getRange(2, 2, sheet.getLastRow() - 1, 2), '#,##0.00', [], 'monthlyVat.money');
+  }
+
+  return {
+    monthLabel: Utilities.formatDate(report.monthDate, 'UTC', 'yyyy-MM'),
+    sales: report.sales,
+    vat: report.vat,
+    rows: report.rows
+  };
+}
+
+function parseMonthlyVatReport_(content, fileName) {
+  const lines = splitLines_(content).filter(function(line) { return line.trim() !== ''; });
+  if (lines.length < 2) throw new Error('Файл порожній або не містить даних: ' + fileName);
+
+  const sep = detectSep_(lines[0]);
+  const headers = splitTsvLine_(lines[0], sep).map(normalizeHeader_);
+
+  const salesIdx = findHeaderIdx_(headers, ['item-price', 'itemprice', 'principal', 'sales', 'product sales']);
+  const vatIdx = findHeaderIdx_(headers, ['item-related-fee-tax', 'tax', 'vat', 'vat amount', 'itemtax']);
+  const dateIdx = findHeaderIdx_(headers, ['posted-date', 'date/time', 'settlement-start-date', 'transaction-date', 'date']);
+
+  if (salesIdx < 0) throw new Error('Не знайдено колонку продажів (ItemPrice/Principal/Sales).');
+  if (vatIdx < 0) throw new Error('Не знайдено колонку ПДВ (VAT/Tax).');
+
+  let salesC = 0;
+  let vatC = 0;
+  let rows = 0;
+  let firstDate = null;
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = splitTsvLine_(lines[i], sep);
+    if (!cols.length) continue;
+
+    salesC += toCents_(parseSmartNumber_(cols[salesIdx]));
+    vatC += toCents_(parseSmartNumber_(cols[vatIdx]));
+    rows++;
+
+    if (!firstDate && dateIdx >= 0) {
+      const d = parseDateMaybe_(cols[dateIdx]);
+      if (d) firstDate = d;
+    }
+  }
+
+  const monthDate = firstDate
+    ? new Date(Date.UTC(firstDate.getUTCFullYear(), firstDate.getUTCMonth(), 1))
+    : parseMonthFromFilename_(fileName);
+
+  if (!monthDate) throw new Error('Не вдалося визначити місяць: додайте дату у файл або у назву файлу (наприклад 2025-01).');
+
+  return {
+    monthDate: monthDate,
+    sales: fromCents_(salesC),
+    vat: fromCents_(vatC),
+    rows: rows
+  };
+}
+
+function upsertMonthlyVatRow_(sheet, entry) {
+  const key = Utilities.formatDate(entry.monthDate, 'UTC', 'yyyy-MM');
+  const lastRow = sheet.getLastRow();
+  const rowValues = [entry.monthDate, entry.sales, entry.vat, entry.rows, entry.fileName, entry.fileId, entry.importedAt];
+
+  if (lastRow < 2) {
+    sheet.getRange(2, 1, 1, rowValues.length).setValues([rowValues]);
+    return;
+  }
+
+  const existing = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (let i = 0; i < existing.length; i++) {
+    const d = existing[i][0];
+    if (d instanceof Date && !isNaN(d.getTime()) && Utilities.formatDate(d, 'UTC', 'yyyy-MM') === key) {
+      sheet.getRange(i + 2, 1, 1, rowValues.length).setValues([rowValues]);
+      return;
+    }
+  }
+
+  sheet.getRange(lastRow + 1, 1, 1, rowValues.length).setValues([rowValues]);
 }
 
 function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
@@ -1511,6 +1836,52 @@ function indexMap_(headers) {
   });
 
   return map;
+}
+
+
+function splitLines_(content) {
+  return String(content || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+}
+
+function detectSep_(headerLine) {
+  const line = String(headerLine || '');
+  const tab = (line.match(/	/g) || []).length;
+  const semicolon = (line.match(/;/g) || []).length;
+  const comma = (line.match(/,/g) || []).length;
+  if (tab >= semicolon && tab >= comma) return '	';
+  if (semicolon >= comma) return ';';
+  return ',';
+}
+
+function splitTsvLine_(line, sep) {
+  return String(line || '').split(sep || '	');
+}
+
+function findHeaderIdx_(normalizedHeaders, variants) {
+  const target = variants.map(function(v) { return normalizeHeader_(v); });
+  for (let i = 0; i < normalizedHeaders.length; i++) {
+    if (target.indexOf(normalizedHeaders[i]) !== -1) return i;
+  }
+  return -1;
+}
+
+function parseSmartNumber_(value) {
+  return parseNumberLoose_(value);
+}
+
+function parseDateMaybe_(value) {
+  return parseDateFlexible_(value, CONFIG.TZ);
+}
+
+function parseMonthFromFilename_(fileName) {
+  const raw = String(fileName || '');
+  let m = raw.match(/(20\d{2})[-_.](0[1-9]|1[0-2])/);
+  if (m) return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, 1));
+
+  m = raw.match(/(0[1-9]|1[0-2])[-_.](20\d{2})/);
+  if (m) return new Date(Date.UTC(Number(m[2]), Number(m[1]) - 1, 1));
+
+  return null;
 }
 
 function safeSplitTsv_(line, expectedLen) {
