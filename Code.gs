@@ -328,6 +328,19 @@ function importAllSettlementsFromFolder_(options) {
   const errors = [];
   let imported = 0;
   const progressEvery = Math.max(1, Number(options.progressEvery) || 0);
+  const rebuildEvery = Math.max(1, Number(options.rebuildEvery) || progressEvery || 10);
+  let importedSinceRebuild = 0;
+
+  function runBulkCheckpointRebuild_(reason) {
+    if (importedSinceRebuild < 1) return;
+    runNonCritical_('ensureMonthAndTotals_ [' + reason + ']', function() {
+      ensureMonthAndTotals_(warnings);
+    }, warnings);
+    runNonCritical_('rebuildMonthly_ [' + reason + ']', function() {
+      rebuildMonthly_(warnings);
+    }, warnings);
+    importedSinceRebuild = 0;
+  }
 
   for (let i = 0; i < candidates.length; i++) {
     const fileMeta = candidates[i];
@@ -337,10 +350,15 @@ function importAllSettlementsFromFolder_(options) {
         skipPostImportRebuild: true
       });
       imported++;
+      importedSinceRebuild++;
     } catch (e) {
       const emsg = '[' + fileMeta.name + '] ' + toErrorMessage_(e);
       errors.push(emsg);
       Logger.log('[BULK IMPORT ERROR] ' + emsg);
+    }
+
+    if ((i + 1) % rebuildEvery === 0) {
+      runBulkCheckpointRebuild_('checkpoint ' + (i + 1) + '/' + candidates.length);
     }
 
     if (progressEvery > 0 && ((i + 1) % progressEvery === 0 || i === candidates.length - 1)) {
@@ -348,12 +366,7 @@ function importAllSettlementsFromFolder_(options) {
     }
   }
 
-  runNonCritical_('ensureMonthAndTotals_', function() {
-    ensureMonthAndTotals_(warnings);
-  }, warnings);
-  runNonCritical_('rebuildMonthly_', function() {
-    rebuildMonthly_(warnings);
-  }, warnings);
+  runBulkCheckpointRebuild_('final pass');
 
   return {
     total: candidates.length,
