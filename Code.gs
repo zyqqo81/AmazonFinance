@@ -2527,14 +2527,22 @@ function uiValidateTaxReportHeaders_() {
 
 function importTaxReportCsvFromFileId_(fileId, groupDateField) {
   const file = DriveApp.getFileById(fileId);
-  const text = file.getBlob().getDataAsString();
-  const csv = Utilities.parseCsv(text, ',');
-  if (!csv || csv.length < 2) throw new Error('CSV has no data rows.');
+  const parsed = parseTaxCsvFromDriveFile_(file);
+  const csv = parsed.rows;
+  if (!csv || !csv.length) {
+    throw new Error('CSV порожній або не розпізнаний. Файл: ' + file.getName());
+  }
 
-  const headers = (csv[0] || []).map(function(h) { return String(h || '').trim(); });
+  const headers = (csv[0] || []).map(function(h) { return stripBom_(String(h || '').trim()); });
   const hm = buildHeaderMapCaseInsensitive_(headers);
   const missing = findMissingHeaders_(hm, TAX_REQUIRED_HEADERS);
-  if (missing.length) throw new Error('Missing required headers: ' + missing.join(', '));
+  if (missing.length) {
+    throw new Error(
+      'Відсутні обов’язкові заголовки: ' + missing.join(', ') +
+      '. Файл: ' + file.getName() +
+      '. Кодування/розділювач: ' + parsed.encoding + ' / "' + parsed.delimiterLabel + '"'
+    );
+  }
 
   const dateField = normalizeHeaderKey_(groupDateField) === normalizeHeaderKey_(CONFIG.ALT_GROUP_DATE_FIELD)
     ? CONFIG.ALT_GROUP_DATE_FIELD
@@ -2548,12 +2556,20 @@ function importTaxReportCsvFromFileId_(fileId, groupDateField) {
     rawRows.push(headers.map(function(_, idx) { return row[idx] !== undefined ? row[idx] : ''; }).concat(ext));
   }
 
+  if (!rawRows.length) {
+    throw new Error(
+      'CSV не містить рядків даних після заголовка. Файл: ' + file.getName() +
+      '. Рядків у CSV: ' + csv.length +
+      '. Кодування/розділювач: ' + parsed.encoding + ' / "' + parsed.delimiterLabel + '"'
+    );
+  }
+
   const sheet = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
   sheet.clearContents();
   const finalHeaders = headers.concat(TAX_COMPUTED_HEADERS);
   sheet.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
-  if (rawRows.length) sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
-  return { rows: rawRows.length };
+  sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
+  return { rows: rawRows.length, delimiter: parsed.delimiterLabel, encoding: parsed.encoding };
 }
 
 function buildTaxComputedColumns_(headers, row, groupDateField) {
@@ -2861,6 +2877,68 @@ function parseAmazonUtcDate_(s) {
   const mons = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
   if (mons[monTxt] === undefined) return null;
   return new Date(Date.UTC(year, mons[monTxt], day));
+}
+
+
+function parseTaxCsvFromDriveFile_(file) {
+  const blob = file.getBlob();
+  const encodings = ['UTF-8', 'UTF-16LE', 'UTF-16BE', 'windows-1252'];
+  const delimiters = [',', ';', '	'];
+  let best = null;
+
+  for (let e = 0; e < encodings.length; e++) {
+    const encoding = encodings[e];
+    let text = '';
+    try {
+      text = blob.getDataAsString(encoding);
+    } catch (err) {
+      continue;
+    }
+    text = normalizeCsvText_(text);
+    if (!text) continue;
+
+    for (let d = 0; d < delimiters.length; d++) {
+      const delimiter = delimiters[d];
+      let rows = [];
+      try {
+        rows = Utilities.parseCsv(text, delimiter);
+      } catch (err) {
+        continue;
+      }
+      if (!rows || !rows.length) continue;
+
+      const cols = rows[0] ? rows[0].length : 0;
+      const dataRows = Math.max(0, rows.length - 1);
+      const score = dataRows * 1000 + cols;
+      if (!best || score > best.score) {
+        best = {
+          rows: rows,
+          encoding: encoding,
+          delimiter: delimiter,
+          delimiterLabel: delimiter === '	' ? 'TAB' : delimiter,
+          score: score
+        };
+      }
+    }
+  }
+
+  if (!best) {
+    return { rows: [], encoding: 'unknown', delimiter: ',', delimiterLabel: ',', score: 0 };
+  }
+  return best;
+}
+
+function normalizeCsvText_(text) {
+  if (text === null || text === undefined) return '';
+  let s = String(text);
+  s = stripBom_(s);
+  s = s.replace(/\u0000/g, '');
+  s = s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return s.trim();
+}
+
+function stripBom_(s) {
+  return String(s || '').replace(/^\uFEFF/, '');
 }
 
 function isEmptyRow_(row) {
