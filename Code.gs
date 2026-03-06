@@ -2462,15 +2462,22 @@ const VAT_SUMMARY_HEADERS = [
 function uiImportTaxReportByFileId_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    const prompt = ui.prompt('Імпорт Tax Report (CSV) — з Drive File ID', 'Введіть Google Drive File ID:', ui.ButtonSet.OK_CANCEL);
+    const prompt = ui.prompt(
+      'Імпорт Tax Report (CSV) — File ID або Folder ID',
+      'Введіть Google Drive File ID (або Folder ID).\nЯкщо залишити порожнім — автоматично візьметься останній CSV з CONFIG.TAX_REPORT_FOLDER_ID.',
+      ui.ButtonSet.OK_CANCEL
+    );
     if (prompt.getSelectedButton() !== ui.Button.OK) return;
-    const fileId = String(prompt.getResponseText() || '').trim();
-    if (!fileId) {
-      ui.alert('File ID порожній. Імпорт скасовано.');
+    const driveIdOrEmpty = String(prompt.getResponseText() || '').trim();
+
+    if (!driveIdOrEmpty) {
+      const latest = importLatestTaxReportFromConfiguredFolder_(CONFIG.DEFAULT_GROUP_DATE_FIELD);
+      ui.alert('Імпорт Tax Report завершено автоматично.\nФайл: ' + latest.fileName + '\nІмпортовано рядків: ' + latest.rows + '\nАркуш: ' + CONFIG.TAX_RAW_SHEET);
       return;
     }
-    const result = importTaxReportCsvFromFileId_(fileId, CONFIG.DEFAULT_GROUP_DATE_FIELD);
-    ui.alert('Імпорт Tax Report завершено.\nІмпортовано рядків: ' + result.rows + '\nАркуш: ' + CONFIG.TAX_RAW_SHEET);
+
+    const result = importTaxReportByFileOrFolderId_(driveIdOrEmpty, CONFIG.DEFAULT_GROUP_DATE_FIELD);
+    ui.alert('Імпорт Tax Report завершено.\nФайл: ' + result.fileName + '\nІмпортовано рядків: ' + result.rows + '\nАркуш: ' + CONFIG.TAX_RAW_SHEET);
   } catch (e) {
     ui.alert('Помилка імпорту Tax Report: ' + toErrorMessage_(e));
   }
@@ -2479,19 +2486,45 @@ function uiImportTaxReportByFileId_() {
 function uiImportTaxReportLatestFromFolder_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    if (!CONFIG.TAX_REPORT_FOLDER_ID) {
-      ui.alert('CONFIG.TAX_REPORT_FOLDER_ID порожній. Спочатку вкажіть ID папки.');
-      return;
-    }
-    const files = getTaxCsvCandidatesFromFolder_(CONFIG.TAX_REPORT_FOLDER_ID, 1);
-    if (!files.length) {
-      ui.alert('У папці не знайдено CSV файлів: ' + CONFIG.TAX_REPORT_FOLDER_ID);
-      return;
-    }
-    const result = importTaxReportCsvFromFileId_(files[0].id, CONFIG.DEFAULT_GROUP_DATE_FIELD);
-    ui.alert('Імпортовано останній Tax Report: ' + files[0].name + '\nРядків: ' + result.rows);
+    const latest = importLatestTaxReportFromConfiguredFolder_(CONFIG.DEFAULT_GROUP_DATE_FIELD);
+    ui.alert('Імпортовано останній Tax Report: ' + latest.fileName + '\nРядків: ' + latest.rows);
   } catch (e) {
     ui.alert('Помилка імпорту останнього Tax Report: ' + toErrorMessage_(e));
+  }
+}
+
+function importLatestTaxReportFromConfiguredFolder_(groupDateField) {
+  if (!CONFIG.TAX_REPORT_FOLDER_ID) {
+    throw new Error('CONFIG.TAX_REPORT_FOLDER_ID порожній. Вкажіть ID папки у CONFIG.');
+  }
+  const files = getTaxCsvCandidatesFromFolder_(CONFIG.TAX_REPORT_FOLDER_ID, 1);
+  if (!files.length) {
+    throw new Error('У папці не знайдено CSV файлів: ' + CONFIG.TAX_REPORT_FOLDER_ID);
+  }
+  const result = importTaxReportCsvFromFileId_(files[0].id, groupDateField);
+  return { rows: result.rows, fileName: files[0].name, fileId: files[0].id };
+}
+
+function importTaxReportByFileOrFolderId_(driveId, groupDateField) {
+  const id = String(driveId || '').trim();
+  if (!id) throw new Error('Передайте Drive ID файлу або папки.');
+
+  try {
+    const file = DriveApp.getFileById(id);
+    const resultByFile = importTaxReportCsvFromFileId_(id, groupDateField);
+    return { rows: resultByFile.rows, fileName: file.getName(), fileId: id };
+  } catch (fileErr) {
+    try {
+      const files = getTaxCsvCandidatesFromFolder_(id, 1);
+      if (!files.length) throw new Error('У папці не знайдено CSV файлів: ' + id);
+      const resultByFolder = importTaxReportCsvFromFileId_(files[0].id, groupDateField);
+      return { rows: resultByFolder.rows, fileName: files[0].name, fileId: files[0].id };
+    } catch (folderErr) {
+      throw new Error(
+        'Не вдалося імпортувати за переданим ID. Очікується File ID CSV або Folder ID з CSV. ' +
+        'Деталі File ID: ' + toErrorMessage_(fileErr) + '. Деталі Folder ID: ' + toErrorMessage_(folderErr)
+      );
+    }
   }
 }
 
