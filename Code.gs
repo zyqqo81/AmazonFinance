@@ -19,8 +19,10 @@ const CONFIG = {
   TAX_RAW_SHEET: 'TAX_REPORT_RAW',
   VAT_SUMMARY_SHEET: 'VAT_SALES_SUMMARY',
   VAT_PIVOT_SHEET: 'VAT_PIVOT',
+  CURRENT_MONTH_SNAPSHOT_SHEET: 'VAT_CURRENT_MONTH',
   DEFAULT_GROUP_DATE_FIELD: 'Tax Calculation Date',
   ALT_GROUP_DATE_FIELD: 'Order Date',
+  SHIPMENT_DATE_FIELD: 'Shipment Date',
   CURRENCY: 'EUR',
 
   AUDIT: {
@@ -115,6 +117,7 @@ function onOpen() {
     .addItem('Імпорт Tax Report (CSV) — останній з папки', 'uiImportTaxReportLatestFromFolder_')
     .addItem('Побудувати VAT/Sales зведення', 'uiBuildVatSalesSummary_')
     .addItem('Побудувати VAT/Sales зведення (за Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
+    .addItem('Поточний місяць (Shipment Date): продажі, VAT та підсумки', 'uiBuildCurrentMonthVatSalesByShipmentDate_')
     .addItem('Діагностика: перевірити заголовки Tax Report', 'uiValidateTaxReportHeaders_')
     .addToUi();
 }
@@ -2548,6 +2551,31 @@ function uiBuildVatSalesSummaryByOrderDate_() {
   }
 }
 
+
+function uiBuildCurrentMonthVatSalesByShipmentDate_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = buildCurrentMonthVatSalesSnapshot_();
+    const lines = [
+      'Поточний місяць: ' + res.period,
+      'Поле дати: ' + res.groupingDateField,
+      'Рядків враховано: ' + res.rows,
+      'Замовлень: ' + res.orders,
+      'Одиниць: ' + res.units,
+      'Net Sales: ' + res.netSales.toFixed(2) + ' ' + CONFIG.CURRENCY,
+      'VAT (всього): ' + res.vatTotal.toFixed(2) + ' ' + CONFIG.CURRENCY,
+      'Gross Sales: ' + res.grossSales.toFixed(2) + ' ' + CONFIG.CURRENCY,
+      'VAT до сплати (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY,
+      'VAT зібрано Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY
+    ];
+    if (res.warning) lines.push('Увага: ' + res.warning);
+    ui.alert('Поточний місяць (Shipment Date) — підрахунок завершено', lines.join('\n'), ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('Помилка підрахунку поточного місяця за Shipment Date: ' + toErrorMessage_(e));
+  }
+}
+
+
 function uiValidateTaxReportHeaders_() {
   const ui = SpreadsheetApp.getUi();
   try {
@@ -2799,6 +2827,153 @@ function buildVatSalesSummary_(groupDateField) {
   applyVatSummaryFormats_(summary, out.length, metaStart + 2);
 
   return { rows: out.length, vatPayableSeller: vatPayableSeller, vatCollectedMarketplace: vatCollectedMarketplace };
+}
+
+
+function buildCurrentMonthVatSalesSnapshot_() {
+  const raw = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
+  const lastRow = raw.getLastRow();
+  const lastCol = raw.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) throw new Error('TAX_REPORT_RAW is empty. Import CSV first.');
+
+  const all = raw.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+
+  const shipmentHeader = resolveHeaderName_(hm, CONFIG.SHIPMENT_DATE_FIELD);
+  const defaultDateHeader = resolveHeaderName_(hm, CONFIG.DEFAULT_GROUP_DATE_FIELD);
+  const dateHeader = shipmentHeader || defaultDateHeader;
+  if (!dateHeader) {
+    throw new Error('Не знайдено колонки для дати. Очікується "' + CONFIG.SHIPMENT_DATE_FIELD + '" або "' + CONFIG.DEFAULT_GROUP_DATE_FIELD + '".');
+  }
+
+  const required = [
+    'Order ID', 'Quantity', 'Tax Collection Responsibility',
+    'Net Total', 'VAT Total', 'Gross Total',
+    'Net Product', 'VAT Product', 'Net Shipping', 'VAT Shipping', 'Net Giftwrap', 'VAT Giftwrap'
+  ];
+  const missing = findMissingHeaders_(hm, required);
+  if (missing.length) throw new Error('Missing columns in TAX_REPORT_RAW: ' + missing.join(', '));
+
+  const now = new Date();
+  const currentPeriod = Utilities.formatDate(now, CONFIG.TZ, 'yyyy-MM');
+
+  const rowsOut = [];
+  const orders = {};
+  let units = 0;
+  let netSales = 0;
+  let vatTotal = 0;
+  let grossSales = 0;
+  let vatPayableSeller = 0;
+  let vatCollectedMarketplace = 0;
+  let netProduct = 0, vatProduct = 0, netShipping = 0, vatShipping = 0, netGiftwrap = 0, vatGiftwrap = 0;
+
+  for (let i = 1; i < all.length; i++) {
+    const row = all[i];
+    if (isEmptyRow_(row)) continue;
+
+    const d = parseAmazonUtcDate_(valueByHeader_(row, hm, dateHeader));
+    if (!d) continue;
+    const period = Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM');
+    if (period !== currentPeriod) continue;
+
+    rowsOut.push(row);
+    const orderId = String(valueByHeader_(row, hm, 'Order ID') || '').trim();
+    if (orderId) orders[orderId] = true;
+
+    const rowUnits = parseNumberFlexible_(valueByHeader_(row, hm, 'Quantity'));
+    const rowNet = parseNumberFlexible_(valueByHeader_(row, hm, 'Net Total'));
+    const rowVat = parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Total'));
+    const rowGross = parseNumberFlexible_(valueByHeader_(row, hm, 'Gross Total'));
+
+    units += rowUnits;
+    netSales += rowNet;
+    vatTotal += rowVat;
+    grossSales += rowGross;
+
+    netProduct += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Product'));
+    vatProduct += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Product'));
+    netShipping += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Shipping'));
+    vatShipping += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Shipping'));
+    netGiftwrap += parseNumberFlexible_(valueByHeader_(row, hm, 'Net Giftwrap'));
+    vatGiftwrap += parseNumberFlexible_(valueByHeader_(row, hm, 'VAT Giftwrap'));
+
+    const responsibility = String(valueByHeader_(row, hm, 'Tax Collection Responsibility') || '').trim().toLowerCase();
+    if (responsibility === 'seller') vatPayableSeller += rowVat;
+    else vatCollectedMarketplace += rowVat;
+  }
+
+  writeCurrentMonthSnapshotSheet_({
+    period: currentPeriod,
+    groupingDateField: dateHeader,
+    rows: rowsOut.length,
+    orders: Object.keys(orders).length,
+    units: units,
+    netSales: netSales,
+    vatTotal: vatTotal,
+    grossSales: grossSales,
+    netProduct: netProduct,
+    vatProduct: vatProduct,
+    netShipping: netShipping,
+    vatShipping: vatShipping,
+    netGiftwrap: netGiftwrap,
+    vatGiftwrap: vatGiftwrap,
+    vatPayableSeller: vatPayableSeller,
+    vatCollectedMarketplace: vatCollectedMarketplace,
+    warning: shipmentHeader ? '' : 'Колонку Shipment Date не знайдено, використано Tax Calculation Date.'
+  });
+
+  return {
+    period: currentPeriod,
+    groupingDateField: dateHeader,
+    rows: rowsOut.length,
+    orders: Object.keys(orders).length,
+    units: units,
+    netSales: netSales,
+    vatTotal: vatTotal,
+    grossSales: grossSales,
+    vatPayableSeller: vatPayableSeller,
+    vatCollectedMarketplace: vatCollectedMarketplace,
+    warning: shipmentHeader ? '' : 'Колонку Shipment Date не знайдено, використано Tax Calculation Date.'
+  };
+}
+
+function writeCurrentMonthSnapshotSheet_(snapshot) {
+  const sheet = getOrCreateSheet_(CONFIG.CURRENT_MONTH_SNAPSHOT_SHEET);
+  sheet.clearContents();
+
+  const headers = ['Metric', 'Value'];
+  const rows = [
+    ['Period (YYYY-MM)', snapshot.period],
+    ['Grouping Date Field', snapshot.groupingDateField],
+    ['Rows Included', snapshot.rows],
+    ['Orders (distinct)', snapshot.orders],
+    ['Units', snapshot.units],
+    ['Net Sales (Total)', snapshot.netSales],
+    ['VAT (Total)', snapshot.vatTotal],
+    ['Gross Sales (Total)', snapshot.grossSales],
+    ['Net Product', snapshot.netProduct],
+    ['VAT Product', snapshot.vatProduct],
+    ['Net Shipping', snapshot.netShipping],
+    ['VAT Shipping', snapshot.vatShipping],
+    ['Net Giftwrap', snapshot.netGiftwrap],
+    ['VAT Giftwrap', snapshot.vatGiftwrap],
+    ['VAT Payable (Seller)', snapshot.vatPayableSeller],
+    ['VAT Collected by Marketplace/Amazon', snapshot.vatCollectedMarketplace],
+    ['Warning', snapshot.warning || '']
+  ];
+
+  sheet.getRange(1, 1, 1, 2).setValues([headers]);
+  sheet.getRange(2, 1, rows.length, 2).setValues(rows);
+
+  sheet.getRange(2, 2, 4, 1).setNumberFormat('0');
+  sheet.getRange(6, 2, 11, 1).setNumberFormat('#,##0.00');
+}
+
+function resolveHeaderName_(hm, expectedHeader) {
+  const key = normalizeHeaderKey_(expectedHeader);
+  const idx = hm[key];
+  return idx === undefined ? '' : expectedHeader;
 }
 
 function validateTaxReportHeaders_() {
