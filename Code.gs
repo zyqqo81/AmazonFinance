@@ -111,20 +111,11 @@ function onOpen() {
     .addItem('Перебудувати місячну агрегацію', 'rebuildMonthly_')
     .addItem('Перевірити заголовки', 'validateSummarySheet_')
     .addSeparator()
-    .addItem('Import Tax Report (CSV) — from Drive File ID', 'uiImportTaxReportByFileId_')
-    .addItem('Import Tax Report (CSV) — latest from folder', 'uiImportTaxReportLatestFromFolder_')
-    .addItem('Build VAT/Sales Summary', 'uiBuildVatSalesSummary_')
-    .addItem('Build VAT/Sales Summary (by Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
-    .addItem('Diagnostics: Validate Tax Report Headers', 'uiValidateTaxReportHeaders_')
-    .addToUi();
-
-  SpreadsheetApp.getUi()
-    .createMenu('Amazon Finance')
-    .addItem('Import Tax Report (CSV) — from Drive File ID', 'uiImportTaxReportByFileId_')
-    .addItem('Import Tax Report (CSV) — latest from folder', 'uiImportTaxReportLatestFromFolder_')
-    .addItem('Build VAT/Sales Summary', 'uiBuildVatSalesSummary_')
-    .addItem('Build VAT/Sales Summary (by Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
-    .addItem('Diagnostics: Validate Tax Report Headers', 'uiValidateTaxReportHeaders_')
+    .addItem('Імпорт Tax Report (CSV) — з Drive File ID', 'uiImportTaxReportByFileId_')
+    .addItem('Імпорт Tax Report (CSV) — останній з папки', 'uiImportTaxReportLatestFromFolder_')
+    .addItem('Побудувати VAT/Sales зведення', 'uiBuildVatSalesSummary_')
+    .addItem('Побудувати VAT/Sales зведення (за Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
+    .addItem('Діагностика: перевірити заголовки Tax Report', 'uiValidateTaxReportHeaders_')
     .addToUi();
 }
 
@@ -2381,7 +2372,7 @@ function runNonCritical_(label, fn, warnings) {
 
 function safeToast_(msg) {
   try {
-    SpreadsheetApp.getActive().toast(String(msg || ''), 'Amazon Finance', 8);
+    SpreadsheetApp.getActive().toast(String(msg || ''), 'Фінанси Amazon', 8);
   } catch (e) {
     Logger.log('[TOAST WARN] ' + toErrorMessage_(e));
   }
@@ -2471,17 +2462,17 @@ const VAT_SUMMARY_HEADERS = [
 function uiImportTaxReportByFileId_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    const prompt = ui.prompt('Import Tax Report (CSV) — from Drive File ID', 'Enter Google Drive File ID:', ui.ButtonSet.OK_CANCEL);
+    const prompt = ui.prompt('Імпорт Tax Report (CSV) — з Drive File ID', 'Введіть Google Drive File ID:', ui.ButtonSet.OK_CANCEL);
     if (prompt.getSelectedButton() !== ui.Button.OK) return;
     const fileId = String(prompt.getResponseText() || '').trim();
     if (!fileId) {
-      ui.alert('File ID is empty. Import cancelled.');
+      ui.alert('File ID порожній. Імпорт скасовано.');
       return;
     }
     const result = importTaxReportCsvFromFileId_(fileId, CONFIG.DEFAULT_GROUP_DATE_FIELD);
-    ui.alert('Tax report import completed.\nRows imported: ' + result.rows + '\nSheet: ' + CONFIG.TAX_RAW_SHEET);
+    ui.alert('Імпорт Tax Report завершено.\nІмпортовано рядків: ' + result.rows + '\nАркуш: ' + CONFIG.TAX_RAW_SHEET);
   } catch (e) {
-    ui.alert('Tax report import failed: ' + toErrorMessage_(e));
+    ui.alert('Помилка імпорту Tax Report: ' + toErrorMessage_(e));
   }
 }
 
@@ -2489,18 +2480,18 @@ function uiImportTaxReportLatestFromFolder_() {
   const ui = SpreadsheetApp.getUi();
   try {
     if (!CONFIG.TAX_REPORT_FOLDER_ID) {
-      ui.alert('CONFIG.TAX_REPORT_FOLDER_ID is empty. Set folder id first.');
+      ui.alert('CONFIG.TAX_REPORT_FOLDER_ID порожній. Спочатку вкажіть ID папки.');
       return;
     }
     const files = getTaxCsvCandidatesFromFolder_(CONFIG.TAX_REPORT_FOLDER_ID, 1);
     if (!files.length) {
-      ui.alert('No CSV files found in folder: ' + CONFIG.TAX_REPORT_FOLDER_ID);
+      ui.alert('У папці не знайдено CSV файлів: ' + CONFIG.TAX_REPORT_FOLDER_ID);
       return;
     }
     const result = importTaxReportCsvFromFileId_(files[0].id, CONFIG.DEFAULT_GROUP_DATE_FIELD);
-    ui.alert('Latest tax report imported: ' + files[0].name + '\nRows: ' + result.rows);
+    ui.alert('Імпортовано останній Tax Report: ' + files[0].name + '\nРядків: ' + result.rows);
   } catch (e) {
-    ui.alert('Import latest tax report failed: ' + toErrorMessage_(e));
+    ui.alert('Помилка імпорту останнього Tax Report: ' + toErrorMessage_(e));
   }
 }
 
@@ -2508,9 +2499,9 @@ function uiBuildVatSalesSummary_() {
   const ui = SpreadsheetApp.getUi();
   try {
     const res = buildVatSalesSummary_(CONFIG.DEFAULT_GROUP_DATE_FIELD);
-    ui.alert('VAT/Sales summary built.\nRows: ' + res.rows + '\nVAT Payable (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT Collected by Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
+    ui.alert('VAT/Sales зведення побудовано.\nРядків: ' + res.rows + '\nVAT до сплати (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT зібрано Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
   } catch (e) {
-    ui.alert('Build VAT/Sales summary failed: ' + toErrorMessage_(e));
+    ui.alert('Помилка побудови VAT/Sales зведення: ' + toErrorMessage_(e));
   }
 }
 
@@ -2518,9 +2509,9 @@ function uiBuildVatSalesSummaryByOrderDate_() {
   const ui = SpreadsheetApp.getUi();
   try {
     const res = buildVatSalesSummary_(CONFIG.ALT_GROUP_DATE_FIELD);
-    ui.alert('VAT/Sales summary (Order Date) built.\nRows: ' + res.rows + '\nVAT Payable (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT Collected by Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
+    ui.alert('VAT/Sales зведення (Order Date) побудовано.\nРядків: ' + res.rows + '\nVAT до сплати (Seller): ' + res.vatPayableSeller.toFixed(2) + ' ' + CONFIG.CURRENCY + '\nVAT зібрано Marketplace/Amazon: ' + res.vatCollectedMarketplace.toFixed(2) + ' ' + CONFIG.CURRENCY);
   } catch (e) {
-    ui.alert('Build VAT/Sales summary by Order Date failed: ' + toErrorMessage_(e));
+    ui.alert('Помилка побудови VAT/Sales зведення за Order Date: ' + toErrorMessage_(e));
   }
 }
 
@@ -2530,7 +2521,7 @@ function uiValidateTaxReportHeaders_() {
     const report = validateTaxReportHeaders_();
     ui.alert(report);
   } catch (e) {
-    ui.alert('Diagnostics failed: ' + toErrorMessage_(e));
+    ui.alert('Помилка діагностики: ' + toErrorMessage_(e));
   }
 }
 
