@@ -2585,11 +2585,30 @@ function importTaxReportCsvFromFileId_(fileId, groupDateField) {
   }
 
   const sheet = getOrCreateSheet_(CONFIG.TAX_RAW_SHEET);
-  sheet.clearContents();
+  sheet.clear();
   const finalHeaders = headers.concat(TAX_COMPUTED_HEADERS);
   sheet.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
-  if (rawRows.length) sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
+  if (rawRows.length) {
+    sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
+    applyTaxRawFormats_(sheet, rawRows.length, headers.length, TAX_COMPUTED_HEADERS.length);
+  }
   return { rows: rawRows.length };
+}
+
+function applyTaxRawFormats_(sheet, rowCount, sourceColsCount, computedColsCount) {
+  if (!sheet || rowCount <= 0) return;
+
+  if (sourceColsCount > 0) {
+    // Keep imported CSV values as plain text so decimal values like "01.09" are not auto-converted to dates.
+    sheet.getRange(2, 1, rowCount, sourceColsCount).setNumberFormat('@');
+  }
+
+  if (computedColsCount > 0) {
+    sheet.getRange(2, sourceColsCount + 1, rowCount, 1).setNumberFormat('yyyy-MM');
+    if (computedColsCount > 1) {
+      sheet.getRange(2, sourceColsCount + 2, rowCount, computedColsCount - 1).setNumberFormat('#,##0.00');
+    }
+  }
 }
 
 function parseTaxReportTable_(text) {
