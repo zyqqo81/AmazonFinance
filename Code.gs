@@ -15,7 +15,7 @@ const CONFIG = {
   MONTHLY_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   MONTHLY_REPORT_SHEET: 'ПДВ ЗВІТ',
 
-  TAX_REPORT_FOLDER_ID: '',
+  TAX_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   TAX_RAW_SHEET: 'TAX_REPORT_RAW',
   VAT_SUMMARY_SHEET: 'VAT_SALES_SUMMARY',
   VAT_PIVOT_SHEET: 'VAT_PIVOT',
@@ -2528,8 +2528,11 @@ function uiValidateTaxReportHeaders_() {
 function importTaxReportCsvFromFileId_(fileId, groupDateField) {
   const file = DriveApp.getFileById(fileId);
   const text = file.getBlob().getDataAsString();
-  const csv = Utilities.parseCsv(text, ',');
-  if (!csv || csv.length < 2) throw new Error('CSV has no data rows.');
+  const parsed = parseTaxReportTable_(text);
+  const csv = parsed.rows;
+  if (!csv || csv.length < 2) {
+    throw new Error('CSV has no data rows. Delimiter detected: ' + parsed.delimiterLabel + '.');
+  }
 
   const headers = (csv[0] || []).map(function(h) { return String(h || '').trim(); });
   const hm = buildHeaderMapCaseInsensitive_(headers);
@@ -2554,6 +2557,35 @@ function importTaxReportCsvFromFileId_(fileId, groupDateField) {
   sheet.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
   if (rawRows.length) sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
   return { rows: rawRows.length };
+}
+
+function parseTaxReportTable_(text) {
+  const cleaned = String(text || '').replace(/^\uFEFF/, '');
+  const lines = cleaned.split(/\r?\n/).filter(function(line) { return String(line || '').trim() !== ''; });
+  if (!lines.length) return { rows: [], delimiterLabel: 'none' };
+
+  const headerLine = lines[0];
+  const delimiterCandidates = [
+    { char: ',', label: 'comma' },
+    { char: ';', label: 'semicolon' },
+    { char: '\t', label: 'tab' }
+  ];
+
+  let best = delimiterCandidates[0];
+  let bestCount = -1;
+  for (let i = 0; i < delimiterCandidates.length; i++) {
+    const d = delimiterCandidates[i];
+    const count = headerLine.split(d.char).length;
+    if (count > bestCount) {
+      best = d;
+      bestCount = count;
+    }
+  }
+
+  return {
+    rows: Utilities.parseCsv(cleaned, best.char),
+    delimiterLabel: best.label
+  };
 }
 
 function buildTaxComputedColumns_(headers, row, groupDateField) {
