@@ -3903,6 +3903,16 @@ function buildSalesTaxMonthlyAgg_() {
   return { byMonth: byMonth, taxRates: taxRates, countries: countries, responsibilities: responsibilities, byFile: byFile };
 }
 
+function resolveSalesTaxAggMonth_(row, hm) {
+  const period = toMonthText_(valueByHeader_(row, hm, 'Period YYYY-MM') || valueByHeader_(row, hm, 'Period') || valueByHeader_(row, hm, 'Month'));
+  if (period) return period;
+
+  const taxDate = toMonthText_(valueByHeader_(row, hm, 'Tax Calculation Date'));
+  if (taxDate) return taxDate;
+
+  return toMonthText_(valueByHeader_(row, hm, 'Order Date'));
+}
+
 function mergeMonthKeys_(a, b) {
   const set = {};
   for (let i = 0; i < a.length; i++) if (a[i]) set[a[i]] = true;
