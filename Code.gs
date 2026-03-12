@@ -25,6 +25,11 @@ const CONFIG = {
   SHIPMENT_DATE_FIELD: 'Shipment Date',
   CURRENCY: 'EUR',
 
+  SALES_TAX_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
+  SALES_TAX_RAW_SHEET: 'SALES_TAX_RAW',
+  MONTHLY_VAT_PAYOUT_SUMMARY_SHEET: 'MONTHLY_VAT_PAYOUT_SUMMARY',
+  DIAGNOSTICS_SHEET: 'DIAGNOSTICS',
+
   AUDIT: {
     ENABLED: true,
     FOLDER_ID: '1ALCVcKM_3QlEeCedr6DE1YNOI5HKzE2s',
@@ -119,6 +124,10 @@ function onOpen() {
     .addItem('Побудувати VAT/Sales зведення (за Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
     .addItem('Поточний місяць (Shipment Date): продажі, VAT та підсумки', 'uiBuildCurrentMonthVatSalesByShipmentDate_')
     .addItem('Діагностика: перевірити заголовки Tax Report', 'uiValidateTaxReportHeaders_')
+    .addSeparator()
+    .addItem('Import Latest Sales/Tax Report from Folder', 'uiImportLatestSalesTaxReportFromFolder_')
+    .addItem('Rebuild Monthly VAT/Payout Summary', 'uiRebuildMonthlyVatPayoutSummary_')
+    .addItem('Run VAT Diagnostics', 'uiRunVatDiagnostics_')
     .addToUi();
 }
 
@@ -3082,6 +3091,369 @@ function findMissingHeaders_(hm, required) {
     if (hm[normalizeHeaderKey_(required[i])] === undefined) missing.push(required[i]);
   }
   return missing;
+}
+
+
+
+/* =========================
+ * EXTENSION: SALES/TAX VAT + PAYOUT MONTHLY SUMMARY (SAFE LAYER)
+ * ========================= */
+
+const SALES_TAX_REQUIRED_HEADERS = [
+  'Order Date',
+  'Tax Calculation Date',
+  'Order ID',
+  'SKU',
+  'Quantity',
+  'Tax Rate',
+  'Tax Collection Responsibility',
+  'Ship To Country',
+  'OUR_PRICE Tax Inclusive Selling Price',
+  'OUR_PRICE Tax Amount',
+  'OUR_PRICE Tax Exclusive Selling Price',
+  'OUR_PRICE Tax Inclusive Promo Amount',
+  'OUR_PRICE Tax Amount Promo',
+  'OUR_PRICE Tax Exclusive Promo Amount',
+  'SHIPPING Tax Inclusive Selling Price',
+  'SHIPPING Tax Amount',
+  'SHIPPING Tax Exclusive Selling Price',
+  'SHIPPING Tax Inclusive Promo Amount',
+  'SHIPPING Tax Amount Promo',
+  'SHIPPING Tax Exclusive Promo Amount',
+  'GIFTWRAP Tax Inclusive Selling Price',
+  'GIFTWRAP Tax Amount',
+  'GIFTWRAP Tax Exclusive Selling Price',
+  'GIFTWRAP Tax Inclusive Promo Amount',
+  'GIFTWRAP Tax Amount Promo',
+  'GIFTWRAP Tax Exclusive Promo Amount'
+];
+
+const SALES_TAX_COMPUTED_HEADERS = [
+  'Month',
+  'Net Product', 'VAT Product', 'Gross Product',
+  'Net Shipping', 'VAT Shipping', 'Gross Shipping',
+  'Net Giftwrap', 'VAT Giftwrap', 'Gross Giftwrap',
+  'Sales Amount', 'VAT Payable', 'Gross Sales',
+  'Source File ID', 'Source File Name', 'Imported At'
+];
+
+function uiImportLatestSalesTaxReportFromFolder_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = importLatestSalesTaxReportFromFolder_();
+    ui.alert('Sales/Tax report imported.\nFile: ' + res.fileName + '\nRows imported: ' + res.rows);
+  } catch (e) {
+    ui.alert('Import failed: ' + toErrorMessage_(e));
+  }
+}
+
+function uiRebuildMonthlyVatPayoutSummary_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = rebuildMonthlyVatPayoutSummary_();
+    ui.alert('MONTHLY_VAT_PAYOUT_SUMMARY rebuilt.\nMonths: ' + res.months + '\nAmazon Paid Out total: ' + res.totalPayout.toFixed(2));
+  } catch (e) {
+    ui.alert('Rebuild failed: ' + toErrorMessage_(e));
+  }
+}
+
+function uiRunVatDiagnostics_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = runVatDiagnostics_();
+    ui.alert('VAT diagnostics complete.\nRows in diagnostics: ' + res.rows);
+  } catch (e) {
+    ui.alert('Diagnostics failed: ' + toErrorMessage_(e));
+  }
+}
+
+function importLatestSalesTaxReportFromFolder_() {
+  const folderId = CONFIG.SALES_TAX_REPORT_FOLDER_ID || CONFIG.TAX_REPORT_FOLDER_ID;
+  if (!folderId) throw new Error('CONFIG.SALES_TAX_REPORT_FOLDER_ID is empty.');
+
+  const files = getTaxCsvCandidatesFromFolder_(folderId, 1);
+  if (!files.length) throw new Error('No sales/tax CSV found in folder: ' + folderId);
+  return importSalesTaxReportCsvFile_(files[0].id, files[0].name);
+}
+
+function importSalesTaxReportCsvFile_(fileId, fileNameHint) {
+  const file = DriveApp.getFileById(fileId);
+  const fileName = fileNameHint || file.getName();
+  const parsed = parseTaxReportTable_(file.getBlob().getDataAsString());
+  const table = parsed.rows;
+  if (!table || table.length < 2) throw new Error('Sales/Tax CSV has no data rows.');
+
+  const headers = (table[0] || []).map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const missing = findMissingHeaders_(hm, SALES_TAX_REQUIRED_HEADERS);
+  if (missing.length) throw new Error('Missing required headers: ' + missing.join(', '));
+
+  const importedAt = new Date();
+  const rows = [];
+  for (let i = 1; i < table.length; i++) {
+    const r = table[i];
+    if (!r || isEmptyRow_(r)) continue;
+    const ext = buildSalesTaxComputedColumns_(r, hm, fileId, fileName, importedAt);
+    rows.push(headers.map(function(_, idx) { return r[idx] === undefined ? '' : r[idx]; }).concat(ext));
+  }
+
+  upsertSalesTaxRawRows_(headers, rows, fileId);
+  return { fileId: fileId, fileName: fileName, rows: rows.length };
+}
+
+function buildSalesTaxComputedColumns_(row, hm, fileId, fileName, importedAt) {
+  function n(name) { return parseNumberFlexible_(valueByHeader_(row, hm, name)); }
+
+  const taxDate = parseAmazonUtcDate_(valueByHeader_(row, hm, 'Tax Calculation Date'));
+  const orderDate = parseAmazonUtcDate_(valueByHeader_(row, hm, 'Order Date'));
+  const monthDate = taxDate || orderDate;
+  const month = monthDate ? Utilities.formatDate(monthDate, CONFIG.TZ, 'yyyy-MM') : '';
+
+  const netProduct = n('OUR_PRICE Tax Exclusive Selling Price') - n('OUR_PRICE Tax Exclusive Promo Amount');
+  const vatProduct = n('OUR_PRICE Tax Amount') - n('OUR_PRICE Tax Amount Promo');
+  const grossProduct = n('OUR_PRICE Tax Inclusive Selling Price') - n('OUR_PRICE Tax Inclusive Promo Amount');
+
+  const netShipping = n('SHIPPING Tax Exclusive Selling Price') - n('SHIPPING Tax Exclusive Promo Amount');
+  const vatShipping = n('SHIPPING Tax Amount') - n('SHIPPING Tax Amount Promo');
+  const grossShipping = n('SHIPPING Tax Inclusive Selling Price') - n('SHIPPING Tax Inclusive Promo Amount');
+
+  const netGiftwrap = n('GIFTWRAP Tax Exclusive Selling Price') - n('GIFTWRAP Tax Exclusive Promo Amount');
+  const vatGiftwrap = n('GIFTWRAP Tax Amount') - n('GIFTWRAP Tax Amount Promo');
+  const grossGiftwrap = n('GIFTWRAP Tax Inclusive Selling Price') - n('GIFTWRAP Tax Inclusive Promo Amount');
+
+  const salesAmount = netProduct + netShipping + netGiftwrap;
+  const vatPayable = vatProduct + vatShipping + vatGiftwrap;
+  const grossSales = grossProduct + grossShipping + grossGiftwrap;
+
+  return [
+    month,
+    netProduct, vatProduct, grossProduct,
+    netShipping, vatShipping, grossShipping,
+    netGiftwrap, vatGiftwrap, grossGiftwrap,
+    salesAmount, vatPayable, grossSales,
+    fileId, fileName, Utilities.formatDate(importedAt, CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss')
+  ];
+}
+
+function upsertSalesTaxRawRows_(sourceHeaders, newRows, fileId) {
+  const sh = getOrCreateSheet_(CONFIG.SALES_TAX_RAW_SHEET);
+  const finalHeaders = sourceHeaders.concat(SALES_TAX_COMPUTED_HEADERS);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  let kept = [];
+  if (lastRow > 1 && lastCol > 0) {
+    const existingAll = sh.getRange(1, 1, lastRow, lastCol).getValues();
+    const existingHeaders = existingAll[0].map(function(h) { return String(h || '').trim(); });
+    const hm = buildHeaderMapCaseInsensitive_(existingHeaders);
+    const sourceFileCol = hm[normalizeHeaderKey_('Source File ID')];
+
+    for (let i = 1; i < existingAll.length; i++) {
+      const row = existingAll[i];
+      const rowFileId = sourceFileCol === undefined ? '' : String(row[sourceFileCol] || '').trim();
+      if (rowFileId && rowFileId === String(fileId)) continue;
+      kept.push(realignRowByHeaders_(existingHeaders, row, finalHeaders));
+    }
+  }
+
+  const out = kept.concat(newRows);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
+  if (out.length) {
+    sh.getRange(2, 1, out.length, finalHeaders.length).setValues(out);
+    applySalesTaxRawFormats_(sh, out.length, sourceHeaders.length, SALES_TAX_COMPUTED_HEADERS.length);
+  }
+}
+
+function realignRowByHeaders_(existingHeaders, row, targetHeaders) {
+  const hm = buildHeaderMapCaseInsensitive_(existingHeaders);
+  const out = new Array(targetHeaders.length);
+  for (let i = 0; i < targetHeaders.length; i++) {
+    const idx = hm[normalizeHeaderKey_(targetHeaders[i])];
+    out[i] = idx === undefined ? '' : (row[idx] === undefined ? '' : row[idx]);
+  }
+  return out;
+}
+
+function applySalesTaxRawFormats_(sheet, rowCount, sourceColsCount, computedColsCount) {
+  if (!sheet || rowCount <= 0) return;
+  safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, sourceColsCount), '@', [], 'salesTax.raw.sourceText');
+  if (computedColsCount > 0) {
+    safeSetNumberFormat_(sheet.getRange(2, sourceColsCount + 1, rowCount, 1), '@', [], 'salesTax.raw.month');
+    safeSetNumberFormat_(sheet.getRange(2, sourceColsCount + 2, rowCount, 12), '#,##0.00', [], 'salesTax.raw.money');
+  }
+}
+
+function rebuildMonthlyVatPayoutSummary_() {
+  const payoutByMonth = buildSettlementPayoutByMonth_();
+  const salesAgg = buildSalesTaxMonthlyAgg_();
+  const months = mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg.byMonth));
+
+  const headers = [
+    'Month',
+    'Amazon Paid Out',
+    'Sales Amount',
+    'VAT Payable',
+    'Remaining After VAT',
+    'Settlement Files Count',
+    'Sales Report Files Count',
+    'Notes / Diagnostics'
+  ];
+
+  const rows = [];
+  let totalPayout = 0;
+  for (let i = 0; i < months.length; i++) {
+    const m = months[i];
+    const p = payoutByMonth[m] || { paidOut: 0, fileIds: {} };
+    const s = salesAgg.byMonth[m] || { salesAmount: 0, vatPayable: 0, fileIds: {} };
+
+    const paidOut = p.paidOut;
+    const salesAmount = s.salesAmount;
+    const vatPayable = s.vatPayable;
+    const remaining = paidOut - vatPayable;
+    totalPayout += paidOut;
+
+    const settlementCount = Object.keys(p.fileIds || {}).length;
+    const salesFileCount = Object.keys(s.fileIds || {}).length;
+    const notes = buildMonthlyVatPayoutNote_(paidOut, salesAmount, vatPayable, settlementCount, salesFileCount);
+
+    rows.push([m, paidOut, salesAmount, vatPayable, remaining, settlementCount, salesFileCount, notes]);
+  }
+
+  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
+    safeSetNumberFormat_(sh.getRange(2, 1, rows.length, 1), '@', [], 'vatPayout.month');
+    safeSetNumberFormat_(sh.getRange(2, 2, rows.length, 4), '#,##0.00', [], 'vatPayout.money');
+    safeSetNumberFormat_(sh.getRange(2, 6, rows.length, 2), '0', [], 'vatPayout.counts');
+  }
+
+  return { months: rows.length, totalPayout: totalPayout };
+}
+
+function buildSettlementPayoutByMonth_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
+  if (!sh) throw new Error('Summary sheet not found: ' + CONFIG.SUMMARY_SHEET);
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return {};
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  const hm = getHeaderMap_(sh);
+  const colMonth = hm[CONFIG.HEADERS.month];
+  const colDeposit = hm[CONFIG.HEADERS.depositDate];
+  const colTransfer = hm[CONFIG.HEADERS.transfer];
+  const colFileId = hm[CONFIG.HEADERS.fileId];
+  if (!colTransfer) throw new Error('Transfer column not found in summary sheet.');
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  const out = {};
+  for (let i = 0; i < data.length; i++) {
+    const r = data[i];
+    const fid = String(colFileId ? r[colFileId - 1] : '').trim();
+    if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
+
+    const month = monthFromSummaryRow_(r, colMonth, colDeposit);
+    if (!month) continue;
+
+    const transfer = parseNumberFlexible_(r[colTransfer - 1]);
+    if (!out[month]) out[month] = { paidOut: 0, fileIds: {} };
+    out[month].paidOut += transfer;
+    if (fid) out[month].fileIds[fid] = true;
+  }
+  return out;
+}
+
+function monthFromSummaryRow_(row, colMonth, colDeposit) {
+  const monthVal = colMonth ? row[colMonth - 1] : '';
+  const monthText = toMonthText_(monthVal);
+  if (monthText) return monthText;
+
+  const depVal = colDeposit ? row[colDeposit - 1] : '';
+  return toMonthText_(depVal);
+}
+
+function toMonthText_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, CONFIG.TZ, 'yyyy-MM');
+  const s = String(value || '').trim();
+  if (!s) return '';
+  if (/^\d{4}-\d{2}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 7);
+  const d = parseAmazonUtcDate_(s);
+  if (d) return Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM');
+  const parsed = new Date(s);
+  if (!isNaN(parsed.getTime())) return Utilities.formatDate(parsed, CONFIG.TZ, 'yyyy-MM');
+  return '';
+}
+
+function buildSalesTaxMonthlyAgg_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SALES_TAX_RAW_SHEET);
+  if (!sh || sh.getLastRow() < 2 || sh.getLastColumn() < 1) return { byMonth: {} };
+
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+
+  const required = ['Month', 'Sales Amount', 'VAT Payable', 'Source File ID'];
+  const missing = findMissingHeaders_(hm, required);
+  if (missing.length) throw new Error('Missing columns in ' + CONFIG.SALES_TAX_RAW_SHEET + ': ' + missing.join(', '));
+
+  const out = {};
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i];
+    const month = String(valueByHeader_(r, hm, 'Month') || '').trim();
+    if (!month) continue;
+
+    if (!out[month]) out[month] = { salesAmount: 0, vatPayable: 0, fileIds: {} };
+    out[month].salesAmount += parseNumberFlexible_(valueByHeader_(r, hm, 'Sales Amount'));
+    out[month].vatPayable += parseNumberFlexible_(valueByHeader_(r, hm, 'VAT Payable'));
+
+    const fid = String(valueByHeader_(r, hm, 'Source File ID') || '').trim();
+    if (fid) out[month].fileIds[fid] = true;
+  }
+
+  return { byMonth: out };
+}
+
+function mergeMonthKeys_(a, b) {
+  const set = {};
+  for (let i = 0; i < a.length; i++) if (a[i]) set[a[i]] = true;
+  for (let j = 0; j < b.length; j++) if (b[j]) set[b[j]] = true;
+  return Object.keys(set).sort();
+}
+
+function buildMonthlyVatPayoutNote_(paidOut, salesAmount, vatPayable, settlementCount, salesFileCount) {
+  const notes = [];
+  if (settlementCount === 0) notes.push('No settlement payout data');
+  if (salesFileCount === 0) notes.push('No sales/tax data');
+  if (salesAmount === 0 && vatPayable === 0 && salesFileCount > 0) notes.push('Sales report present but totals are zero');
+  return notes.join('; ');
+}
+
+function runVatDiagnostics_() {
+  const diagnosticsRows = [];
+
+  const salesSheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SALES_TAX_RAW_SHEET);
+  if (!salesSheet || salesSheet.getLastRow() < 1) {
+    diagnosticsRows.push(['ERROR', 'Missing raw sheet', CONFIG.SALES_TAX_RAW_SHEET]);
+  } else {
+    const headers = salesSheet.getRange(1, 1, 1, salesSheet.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+    const hm = buildHeaderMapCaseInsensitive_(headers);
+    const missing = findMissingHeaders_(hm, SALES_TAX_REQUIRED_HEADERS.concat(SALES_TAX_COMPUTED_HEADERS));
+    diagnosticsRows.push(['INFO', 'Rows in SALES_TAX_RAW', String(Math.max(0, salesSheet.getLastRow() - 1))]);
+    diagnosticsRows.push(['INFO', 'Missing headers', missing.join(', ')]);
+  }
+
+  const summarySheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  diagnosticsRows.push(['INFO', 'Rows in MONTHLY_VAT_PAYOUT_SUMMARY', String(summarySheet ? Math.max(0, summarySheet.getLastRow() - 1) : 0)]);
+
+  const sh = getOrCreateSheet_(CONFIG.DIAGNOSTICS_SHEET);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, 3).setValues([['Level', 'Metric', 'Value']]);
+  if (diagnosticsRows.length) sh.getRange(2, 1, diagnosticsRows.length, 3).setValues(diagnosticsRows);
+  return { rows: diagnosticsRows.length };
 }
 
 function valueByHeader_(row, hm, header) {
