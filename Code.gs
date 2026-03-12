@@ -27,8 +27,8 @@ const CONFIG = {
 
   SALES_TAX_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   SALES_TAX_RAW_SHEET: 'SALES_TAX_RAW',
-  MONTHLY_VAT_PAYOUT_SUMMARY_SHEET: 'MONTHLY_VAT_PAYOUT_SUMMARY',
-  DIAGNOSTICS_SHEET: 'DIAGNOSTICS',
+  MONTHLY_VAT_PAYOUT_SUMMARY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
+  DIAGNOSTICS_SHEET: 'ДІАГНОСТИКА',
 
   AUDIT: {
     ENABLED: true,
@@ -105,31 +105,11 @@ const CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Фінанси Amazon')
-    .addItem('Імпорт місячного звіту (останній із папки)', 'uiImportLatestMonthlyVatReport_')
-    .addItem('Імпорт всіх місячних звітів з папки', 'uiImportAllMonthlyVatReportsFromFolder_')
-    .addItem('Повний перерахунок: всі Settlement + всі місячні звіти', 'uiRecalculateAllSettlementsAndMonthlyReports_')
-    .addItem('Імпорт Settlement (останній із папки)', 'uiImportLatestFromFolder_')
-    .addItem('Імпорт Settlement (вибір зі списку файлів)', 'uiImportChooseFromFolderList_')
-    .addItem('Оновити всі Settlement з папки', 'uiImportAllFromFolder_')
-    .addItem('Створити/оновити аудит для вибраного рядка', 'uiCreateAuditForSelectedRow_')
-    .addItem('Імпорт Settlement (TSV)', 'uiImportByFileId_')
-    .addItem('Налагодження аудиту для вибраного рядка', 'uiDebugAuditForSelectedRow_')
-    .addSeparator()
-    .addItem('Перебудувати місячну агрегацію', 'rebuildMonthly_')
-    .addItem('Перевірити заголовки', 'validateSummarySheet_')
-    .addSeparator()
-    .addItem('Імпорт Tax Report (CSV) — з Drive File ID', 'uiImportTaxReportByFileId_')
-    .addItem('Імпорт Tax Report (CSV) — останній з папки', 'uiImportTaxReportLatestFromFolder_')
-    .addItem('Побудувати VAT/Sales зведення', 'uiBuildVatSalesSummary_')
-    .addItem('Побудувати VAT/Sales зведення (за Order Date)', 'uiBuildVatSalesSummaryByOrderDate_')
-    .addItem('Поточний місяць (Shipment Date): продажі, VAT та підсумки', 'uiBuildCurrentMonthVatSalesByShipmentDate_')
-    .addItem('Діагностика: перевірити заголовки Tax Report', 'uiValidateTaxReportHeaders_')
-    .addSeparator()
-    .addItem('Import All Sales/Tax Reports from Folder', 'menuImportAllSalesTaxReports_')
-    .addItem('Import Only New Sales/Tax Reports', 'menuImportOnlyNewSalesTaxReports_')
-    .addItem('Reimport All Sales/Tax Reports from Folder', 'menuReimportAllSalesTaxReports_')
-    .addItem('Rebuild Monthly VAT/Payout Summary', 'menuRebuildMonthlyVatPayoutSummary_')
-    .addItem('Run VAT Diagnostics', 'menuRunVatDiagnostics_')
+    .addItem('Завантажити всі settlement файли', 'uiImportAllFromFolder_')
+    .addItem('Завантажити всі sales звіти', 'menuImportAllSalesTaxReports_')
+    .addItem('Перерахувати фінансовий звіт', 'menuRebuildMonthlyVatPayoutSummary_')
+    .addItem('Перерахувати лише останній місяць', 'menuRebuildLatestMonthOnly_')
+    .addItem('Показати діагностику', 'menuRunVatDiagnostics_')
     .addToUi();
 }
 
@@ -3133,6 +3113,7 @@ const SALES_TAX_REQUIRED_HEADERS = [
 const SALES_TAX_COMPUTED_HEADERS = [
   'Month',
   'Period',
+  'Period YYYY-MM',
   'Source Month',
   'Net Product', 'VAT Product', 'Gross Product',
   'Net Shipping', 'VAT Shipping', 'Gross Shipping',
@@ -3200,6 +3181,22 @@ function menuRebuildMonthlyVatPayoutSummary_() {
 
 function menuRunVatDiagnostics_() {
   return uiRunVatDiagnostics_();
+}
+
+function menuRebuildLatestMonthOnly_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = rebuildLatestMonthOnly_();
+    ui.alert([
+      'Перерахунок останнього місяця завершено.',
+      'Місяць: ' + (res.month || '-'),
+      'Виплата Amazon: ' + res.paidOut.toFixed(2),
+      'Продажі: ' + res.salesAmount.toFixed(2),
+      'НДС до сплати: ' + res.vatPayable.toFixed(2)
+    ].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка перерахунку останнього місяця: ' + toErrorMessage_(e));
+  }
 }
 
 function uiImportLatestSalesTaxReportFromFolder_() {
@@ -3343,6 +3340,7 @@ function buildSalesTaxComputedColumns_(row, hm, fileId, fileName, importedAtText
   const rowHash = buildSalesTaxRowHash_(row, hm, period, netSalesTotal, vatTotal);
 
   return [
+    period,
     period,
     period,
     period,
@@ -3503,21 +3501,71 @@ function applySalesTaxRawFormats_(sheet, rowCount, sourceColsCount, computedCols
   }
 }
 
+
+function rebuildLatestMonthOnly_() {
+  const payoutByMonth = buildSettlementPayoutByMonth_();
+  const salesAgg = buildSalesTaxMonthlyAgg_();
+  const months = Object.keys(salesAgg.byMonth || {}).sort();
+  if (!months.length) throw new Error('У SALES_TAX_RAW немає даних для розрахунку останнього місяця.');
+
+  const month = months[months.length - 1];
+  const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
+  const s = salesAgg.byMonth[month] || { salesAmount: 0, vatPayable: 0, fileIds: {}, rows: 0 };
+
+  const paidOut = p.paidOut;
+  const salesAmount = s.salesAmount;
+  const vatPayable = s.vatPayable;
+  const remaining = paidOut - vatPayable;
+  const settlementCount = Object.keys(p.fileIds || {}).length;
+  const salesFileCount = Object.keys(s.fileIds || {}).length;
+  const notes = buildMonthlyVatPayoutNote_(paidOut, salesAmount, vatPayable, settlementCount, salesFileCount, s.rows);
+
+  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const headers = [
+    'Місяць',
+    'Виплата Amazon',
+    'Продажі',
+    'НДС до сплати',
+    'Залишок після НДС',
+    'Кількість settlement файлів',
+    'Кількість sales файлів',
+    'Кількість sales рядків',
+    'Нотатки / Діагностика'
+  ];
+
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sh.getRange(2, 1, 1, headers.length).setValues([[month, paidOut, salesAmount, vatPayable, remaining, settlementCount, salesFileCount, s.rows, notes]]);
+  safeSetNumberFormat_(sh.getRange(2, 1, 1, 1), '@', [], 'monthly.last.month');
+  safeSetNumberFormat_(sh.getRange(2, 2, 1, 4), '#,##0.00', [], 'monthly.last.money');
+  safeSetNumberFormat_(sh.getRange(2, 6, 1, 3), '0', [], 'monthly.last.counts');
+
+  return {
+    month: month,
+    paidOut: paidOut,
+    salesAmount: salesAmount,
+    vatPayable: vatPayable,
+    remaining: remaining,
+    settlementCount: settlementCount,
+    salesFileCount: salesFileCount
+  };
+}
+
 function rebuildMonthlyVatPayoutSummary_() {
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const salesAgg = buildSalesTaxMonthlyAgg_();
   const months = mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg.byMonth));
 
   const headers = [
-    'Month',
-    'Amazon Paid Out',
-    'Sales Amount',
-    'VAT Payable',
-    'Remaining After VAT',
-    'Settlement Files Count',
-    'Sales Report Files Count',
-    'Sales Raw Rows Count',
-    'Notes / Diagnostics'
+    'Місяць',
+    'Виплата Amazon',
+    'Продажі',
+    'НДС до сплати',
+    'Залишок після НДС',
+    'Кількість settlement файлів',
+    'Кількість sales файлів',
+    'Кількість sales рядків',
+    'Нотатки / Діагностика'
   ];
 
   const rows = [];
@@ -3616,14 +3664,14 @@ function buildSalesTaxMonthlyAgg_() {
   const headers = all[0].map(function(h) { return String(h || '').trim(); });
   const hm = buildHeaderMapCaseInsensitive_(headers);
 
-  const required = ['Period', 'Net Sales Total', 'VAT Total', 'Import File ID'];
+  const required = ['Net Sales Total', 'VAT Total', 'Import File ID'];
   const missing = findMissingHeaders_(hm, required);
   if (missing.length) throw new Error('Missing columns in ' + CONFIG.SALES_TAX_RAW_SHEET + ': ' + missing.join(', '));
 
   const out = {};
   for (let i = 1; i < all.length; i++) {
     const r = all[i];
-    const month = String(valueByHeader_(r, hm, 'Period') || valueByHeader_(r, hm, 'Month') || '').trim();
+    const month = String(valueByHeader_(r, hm, 'Period YYYY-MM') || valueByHeader_(r, hm, 'Period') || valueByHeader_(r, hm, 'Month') || '').trim();
     if (!month) continue;
 
     if (!out[month]) out[month] = { salesAmount: 0, vatPayable: 0, fileIds: {}, rows: 0 };
@@ -3669,7 +3717,7 @@ function writeDiagnostics_() {
     const hm = buildHeaderMapCaseInsensitive_(headers);
     const missing = findMissingHeaders_(hm, SALES_TAX_REQUIRED_HEADERS.concat(SALES_TAX_COMPUTED_HEADERS));
 
-    diagnosticsRows.push(['INFO', 'General', 'Rows in SALES_TAX_RAW', String(all.length - 1)]);
+    diagnosticsRows.push(['INFO', 'General', 'Рядків у SALES_TAX_RAW', String(all.length - 1)]);
     diagnosticsRows.push(['INFO', 'General', 'Missing headers', missing.join(', ')]);
 
     const importedRegistry = {};
@@ -3770,7 +3818,7 @@ function writeDiagnostics_() {
   }
 
   const summarySheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
-  diagnosticsRows.push(['INFO', 'General', 'Rows in MONTHLY_VAT_PAYOUT_SUMMARY', String(summarySheet ? Math.max(0, summarySheet.getLastRow() - 1) : 0)]);
+  diagnosticsRows.push(['INFO', 'General', 'Рядків у МІСЯЧНИЙ_ЗВІТ', String(summarySheet ? Math.max(0, summarySheet.getLastRow() - 1) : 0)]);
 
   const sh = getOrCreateSheet_(CONFIG.DIAGNOSTICS_SHEET);
   sh.clearContents();
