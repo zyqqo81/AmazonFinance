@@ -3671,7 +3671,7 @@ function buildSalesTaxMonthlyAgg_() {
   const out = {};
   for (let i = 1; i < all.length; i++) {
     const r = all[i];
-    const month = String(valueByHeader_(r, hm, 'Period YYYY-MM') || valueByHeader_(r, hm, 'Period') || valueByHeader_(r, hm, 'Month') || '').trim();
+    const month = resolveSalesTaxAggMonth_(r, hm);
     if (!month) continue;
 
     if (!out[month]) out[month] = { salesAmount: 0, vatPayable: 0, fileIds: {}, rows: 0 };
@@ -3684,6 +3684,16 @@ function buildSalesTaxMonthlyAgg_() {
   }
 
   return { byMonth: out };
+}
+
+function resolveSalesTaxAggMonth_(row, hm) {
+  const period = toMonthText_(valueByHeader_(row, hm, 'Period YYYY-MM') || valueByHeader_(row, hm, 'Period') || valueByHeader_(row, hm, 'Month'));
+  if (period) return period;
+
+  const taxDate = toMonthText_(valueByHeader_(row, hm, 'Tax Calculation Date'));
+  if (taxDate) return taxDate;
+
+  return toMonthText_(valueByHeader_(row, hm, 'Order Date'));
 }
 
 function mergeMonthKeys_(a, b) {
