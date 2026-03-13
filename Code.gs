@@ -3901,21 +3901,17 @@ function onOpen() {
     .addItem('Завантажити всі sales звіти', 'menuImportAllSalesTaxReports_')
     .addItem('Завантажити тільки останній sales звіт', 'menuImportLatestSalesTaxReport_')
     .addSeparator()
+    .addItem('Оновити лист введення НДС', 'menuEnsureManualVatSheet_')
     .addItem('Оновити лист введення комісій', 'menuEnsureManualFeesSheet_')
+    .addSeparator()
     .addItem('Перерахувати весь місячний звіт', 'menuRebuildMonthlyReport_')
     .addItem('Перерахувати тільки останній місяць', 'menuRebuildLatestMonthOnly_')
-    .addSeparator()
     .addItem('Показати діагностику', 'menuRunDiagnostics_')
     .addToUi();
 }
 
-function menuImportAllSettlements_() {
-  return uiImportAllFromFolder_();
-}
-
-function menuImportLatestSettlement_() {
-  return uiImportLatestFromFolder_();
-}
+function menuImportAllSettlements_() { return uiImportAllFromFolder_(); }
+function menuImportLatestSettlement_() { return uiImportLatestFromFolder_(); }
 
 function menuImportLatestSalesTaxReport_() {
   const ui = SpreadsheetApp.getUi();
@@ -3924,6 +3920,32 @@ function menuImportLatestSalesTaxReport_() {
     ui.alert(['Імпорт останнього sales/tax звіту завершено.', 'Файл: ' + res.fileName, 'Рядків імпортовано: ' + res.rows].join('\n'));
   } catch (e) {
     ui.alert('Помилка імпорту latest sales/tax: ' + toErrorMessage_(e));
+  }
+}
+
+function menuImportAllSalesTaxReports_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = importAllSalesTaxFilesFromFolder_();
+    ui.alert([
+      'Імпорт всіх sales/tax звітів завершено.',
+      'Знайдено файлів: ' + res.total,
+      'Імпортовано: ' + res.imported,
+      'Пропущено (вже були): ' + res.skipped,
+      'Помилки: ' + res.errors.length
+    ].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка імпорту sales/tax: ' + toErrorMessage_(e));
+  }
+}
+
+function menuEnsureManualVatSheet_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = ensureManualVatSheet_();
+    ui.alert(['Лист ручного введення НДС готовий.', 'Лист: ' + res.sheetName, 'Створено: ' + (res.created ? 'так' : 'ні')].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка підготовки листа НДС: ' + toErrorMessage_(e));
   }
 }
 
@@ -3944,6 +3966,16 @@ function menuRebuildMonthlyReport_() {
     ui.alert(['Місячний звіт перераховано.', 'Місяців: ' + res.months, 'Сума виплат Amazon: ' + res.totalPayout.toFixed(2)].join('\n'));
   } catch (e) {
     ui.alert('Помилка перерахунку місячного звіту: ' + toErrorMessage_(e));
+  }
+}
+
+function menuRebuildLatestMonthOnly_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = rebuildLatestMonthOnly_();
+    ui.alert(['Останній місяць перераховано.', 'Місяць: ' + res.month, 'Виплата: ' + res.paidOut.toFixed(2), 'НДС до оплати: ' + res.vatToPay.toFixed(2)].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка перерахунку останнього місяця: ' + toErrorMessage_(e));
   }
 }
 
@@ -3973,100 +4005,126 @@ function importLatestSalesTaxFileFromFolder_() {
   return res;
 }
 
-function menuImportAllSalesTaxReports_() {
-  const ui = SpreadsheetApp.getUi();
-  try {
-    const res = importAllSalesTaxFilesFromFolder_();
-    ui.alert([
-      'Імпорт всіх sales/tax звітів завершено.',
-      'Знайдено файлів: ' + res.total,
-      'Імпортовано: ' + res.imported,
-      'Пропущено (вже були): ' + res.skipped,
-      'Помилки: ' + res.errors.length
-    ].join('\n'));
-  } catch (e) {
-    ui.alert('Помилка імпорту sales/tax: ' + toErrorMessage_(e));
-  }
+function ensureManualVatSheet_() {
+  return ensureInputSheetWithHeaders_('ВВЕДЕННЯ_НДС', ['Місяць', 'Сплачений НДС', 'Коментар'], 'manualVat');
 }
 
 function ensureManualFeesSheet_() {
-  const sheetName = 'ВВЕДЕННЯ_КОМІСІЙ';
-  const headers = [
-    'Місяць',
-    'Комісії Amazon без НДС',
-    'НДС на комісії Amazon',
-    'Комісії Amazon з НДС',
-    'Коментар'
-  ];
+  return ensureInputSheetWithHeaders_('ВВЕДЕННЯ_КОМІСІЙ', ['Місяць', 'Комісії Amazon', 'Коментар'], 'manualFees');
+}
 
+function ensureInputSheetWithHeaders_(sheetName, requiredHeaders, formatPrefix) {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(sheetName);
   const created = !sh;
   if (!sh) sh = ss.insertSheet(sheetName);
 
-  const existingHeaderRow = sh.getRange(1, 1, 1, Math.max(headers.length, sh.getLastColumn() || 1)).getValues()[0];
-  const mustWriteHeaders = sh.getLastRow() === 0 || !arraysEqualByTrim_(existingHeaderRow.slice(0, headers.length), headers);
-  if (mustWriteHeaders) {
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-  }
+  const maxCols = Math.max(requiredHeaders.length, sh.getLastColumn() || 1);
+  const row1 = sh.getRange(1, 1, 1, maxCols).getValues()[0];
+  const normalized = row1.map(function(h) { return String(h || '').trim(); });
 
-  // User input sheet: this is the stable place where user manually enters Amazon fees and VAT on fees.
-  // Existing user rows are never cleared/replaced; only headers are normalized.
-  if (created && sh.getLastRow() < 2) {
-    sh.getRange(2, 1, 1, headers.length).setValues([['2026-01', '', '', '', 'Приклад: заповніть вручну']]);
+  if (sh.getLastRow() === 0 || normalized.join('') === '') {
+    sh.getRange(1, 1, 1, requiredHeaders.length).setValues([requiredHeaders]);
+  } else {
+    let appendAt = normalized.length;
+    for (let i = 0; i < requiredHeaders.length; i++) {
+      const header = requiredHeaders[i];
+      if (normalized.indexOf(header) === -1) {
+        appendAt += 1;
+        sh.getRange(1, appendAt).setValue(header);
+      }
+    }
   }
 
   const dataRows = Math.max(0, sh.getLastRow() - 1);
   if (dataRows > 0) {
-    safeSetNumberFormat_(sh.getRange(2, 1, dataRows, 1), '@', [], 'manualFees.month');
-    safeSetNumberFormat_(sh.getRange(2, 2, dataRows, 3), '#,##0.00', [], 'manualFees.money');
+    safeSetNumberFormat_(sh.getRange(2, 1, dataRows, 1), '@', [], formatPrefix + '.month');
+    safeSetNumberFormat_(sh.getRange(2, 2, dataRows, 1), '#,##0.00', [], formatPrefix + '.money');
   }
 
   return { sheetName: sheetName, created: created };
 }
 
-function readManualFeesByMonth_() {
-  ensureManualFeesSheet_();
-  const sh = SpreadsheetApp.getActive().getSheetByName('ВВЕДЕННЯ_КОМІСІЙ');
-  if (!sh || sh.getLastRow() < 2) return {};
+function readManualVatByMonth_() {
+  ensureManualVatSheet_();
+  const sh = SpreadsheetApp.getActive().getSheetByName('ВВЕДЕННЯ_НДС');
+  if (!sh || sh.getLastRow() < 2) return { byMonth: {}, warnings: [] };
 
   const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
   const hm = buildHeaderMapCaseInsensitive_(all[0]);
   const out = {};
+  const warnings = [];
 
   for (let i = 1; i < all.length; i++) {
     const r = all[i];
     const month = toMonthText_(valueByHeader_(r, hm, 'Місяць'));
     if (!month) continue;
-
-    const feesExVat = parseNumberFlexible_(valueByHeader_(r, hm, 'Комісії Amazon без НДС'));
-    const vatOnFees = parseNumberFlexible_(valueByHeader_(r, hm, 'НДС на комісії Amazon'));
-    const grossRaw = valueByHeader_(r, hm, 'Комісії Amazon з НДС');
-    const gross = String(grossRaw === null || grossRaw === undefined ? '' : grossRaw).trim() === ''
-      ? (feesExVat + vatOnFees)
-      : parseNumberFlexible_(grossRaw);
-
-    if (!out[month]) out[month] = { amazonFeesExVat: 0, amazonFeesVat: 0, amazonFeesGross: 0, rows: 0, warnings: [] };
-    out[month].amazonFeesExVat += feesExVat;
-    out[month].amazonFeesVat += vatOnFees;
-    out[month].amazonFeesGross += gross;
+    const raw = valueByHeader_(r, hm, 'Сплачений НДС');
+    const paidVat = parseNumberFlexible_(raw);
+    if (!out[month]) out[month] = { paidVat: 0, rows: 0 };
+    out[month].paidVat += paidVat;
     out[month].rows += 1;
+    if (String(raw === null || raw === undefined ? '' : raw).trim() !== '' && !isFinite(Number(String(raw).replace(',', '.')))) {
+      warnings.push('ВВЕДЕННЯ_НДС row ' + (i + 1) + ': невалідне число "' + raw + '" -> 0');
+    }
   }
 
-  return out;
+  return { byMonth: out, warnings: warnings };
+}
+
+function readManualFeesByMonth_() {
+  ensureManualFeesSheet_();
+  const sh = SpreadsheetApp.getActive().getSheetByName('ВВЕДЕННЯ_КОМІСІЙ');
+  if (!sh || sh.getLastRow() < 2) return { byMonth: {}, warnings: [] };
+
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(all[0]);
+  const out = {};
+  const warnings = [];
+
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i];
+    const month = toMonthText_(valueByHeader_(r, hm, 'Місяць'));
+    if (!month) continue;
+    const rawMain = valueByHeader_(r, hm, 'Комісії Amazon');
+    const rawGross = valueByHeader_(r, hm, 'Комісії Amazon з НДС');
+    const rawExVat = valueByHeader_(r, hm, 'Комісії Amazon без НДС');
+    const rawVat = valueByHeader_(r, hm, 'НДС на комісії Amazon');
+    const hasMain = String(rawMain === null || rawMain === undefined ? '' : rawMain).trim() !== '';
+    const hasGross = String(rawGross === null || rawGross === undefined ? '' : rawGross).trim() !== '';
+    const manualFees = hasMain
+      ? parseNumberFlexible_(rawMain)
+      : (hasGross ? parseNumberFlexible_(rawGross) : (parseNumberFlexible_(rawExVat) + parseNumberFlexible_(rawVat)));
+
+    if (!out[month]) out[month] = { fees: 0, rows: 0 };
+    out[month].fees += manualFees;
+    out[month].rows += 1;
+
+    const rawForValidation = hasMain ? rawMain : (hasGross ? rawGross : '');
+    if (String(rawForValidation === null || rawForValidation === undefined ? '' : rawForValidation).trim() !== '' && !isFinite(Number(String(rawForValidation).replace(',', '.')))) {
+      warnings.push('ВВЕДЕННЯ_КОМІСІЙ row ' + (i + 1) + ': невалідне число "' + rawForValidation + '" -> 0');
+    }
+  }
+
+  return { byMonth: out, warnings: warnings };
 }
 
 function rebuildLatestMonthOnly_() {
   const payoutByMonth = buildSettlementPayoutByMonth_();
+  const settlementFees = buildSettlementFeesByMonth_();
   const cogsByMonth = buildSettlementCogsByMonth_();
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
+  const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
 
-  const months = mergeMonthKeys_(mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)), mergeMonthKeys_(Object.keys(cogsByMonth), Object.keys(manualFees)));
+  const months = mergeMonthKeys_(
+    mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), Object.keys(manualFees.byMonth)))
+  );
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, cogsByMonth, salesAgg, manualFees);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
@@ -4075,28 +4133,25 @@ function rebuildLatestMonthOnly_() {
   sh.getRange(2, 1, 1, headers.length).setValues([row]);
   applyMonthlyVatPayoutFormats_(sh, 1);
 
-  return {
-    month: month,
-    paidOut: row[1],
-    salesAmount: row[2],
-    vatPayable: row[8],
-    remaining: row[10],
-    settlementCount: row[12],
-    salesFileCount: row[13]
-  };
+  return { month: month, paidOut: row[1], vatToPay: row[9], salesFileCount: row[12], settlementCount: row[11] };
 }
 
 function rebuildMonthlyVatPayoutSummary_() {
   const payoutByMonth = buildSettlementPayoutByMonth_();
+  const settlementFees = buildSettlementFeesByMonth_();
   const cogsByMonth = buildSettlementCogsByMonth_();
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
+  const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
 
-  const months = mergeMonthKeys_(mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)), mergeMonthKeys_(Object.keys(cogsByMonth), Object.keys(manualFees)));
+  const months = mergeMonthKeys_(
+    mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), Object.keys(manualFees.byMonth)))
+  );
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, cogsByMonth, salesAgg, manualFees);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth);
   });
 
   const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
@@ -4119,47 +4174,48 @@ function monthlyVatPayoutHeaders_() {
     'Продажі без НДС',
     'НДС з продажів',
     'Продажі з НДС',
-    'Комісії Amazon без НДС',
-    'НДС на комісії Amazon',
-    'Комісії Amazon з НДС',
-    'Чистий НДС до сплати',
+    'Комісії Amazon',
     'Собівартість',
+    'Прибуток до НДС',
+    'Вже сплачений НДС',
+    'НДС до оплати',
     'Залишок після НДС',
-    'Залишок після НДС і собівартості',
     'К-сть settlement файлів',
     'К-сть sales файлів',
     'Примітки'
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, cogsByMonth, salesAgg, manualFees) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
-  const cogs = cogsByMonth[month] || { cogs: 0 };
-  const mf = manualFees[month] || { amazonFeesExVat: 0, amazonFeesVat: 0, amazonFeesGross: 0, rows: 0 };
+  const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
+  const paidVat = (manualVatByMonth[month] || { paidVat: 0 }).paidVat;
+  const settlementFees = (settlementFeesByMonth[month] || { fees: 0 }).fees;
+  const hasManualFees = !!manualFeesByMonth[month];
+  const fees = hasManualFees ? manualFeesByMonth[month].fees : settlementFees;
 
-  const vatFromSales = s.vatPayable;
-  const netVatToPay = vatFromSales - mf.amazonFeesVat;
-  const afterVat = p.paidOut - netVatToPay;
-  const afterVatAndCogs = p.paidOut - netVatToPay - cogs.cogs;
+  const profitBeforeVat = p.paidOut - cogs;
+  const vatToPay = s.vatPayable - paidVat;
+  const remainingAfterVat = profitBeforeVat - vatToPay;
 
   const settlementCount = Object.keys(p.fileIds || {}).length;
   const salesFileCount = Object.keys(s.fileIds || {}).length;
-  const notes = buildMonthlyVatPayoutNote_(p.paidOut, s.salesAmount, netVatToPay, settlementCount, salesFileCount, s.rows);
+  const notes = (hasManualFees ? 'Комісії: manual override. ' : 'Комісії: settlement Fees. ') +
+    buildMonthlyVatPayoutNote_(p.paidOut, s.salesAmount, vatToPay, settlementCount, salesFileCount, s.rows);
 
   return [
     month,
     p.paidOut,
     s.salesAmount,
-    vatFromSales,
+    s.vatPayable,
     s.grossSales,
-    mf.amazonFeesExVat,
-    mf.amazonFeesVat,
-    mf.amazonFeesGross,
-    netVatToPay,
-    cogs.cogs,
-    afterVat,
-    afterVatAndCogs,
+    fees,
+    cogs,
+    profitBeforeVat,
+    paidVat,
+    vatToPay,
+    remainingAfterVat,
     settlementCount,
     salesFileCount,
     notes
@@ -4169,8 +4225,31 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, cogsByMonth, salesAgg, 
 function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
   if (!sheet || rowCount <= 0) return;
   safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, 1), '@', [], 'monthly.month');
-  safeSetNumberFormat_(sheet.getRange(2, 2, rowCount, 11), '#,##0.00', [], 'monthly.money');
-  safeSetNumberFormat_(sheet.getRange(2, 13, rowCount, 2), '0', [], 'monthly.counts');
+  safeSetNumberFormat_(sheet.getRange(2, 2, rowCount, 10), '#,##0.00', [], 'monthly.money');
+  safeSetNumberFormat_(sheet.getRange(2, 12, rowCount, 2), '0', [], 'monthly.counts');
+}
+
+function buildSettlementFeesByMonth_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
+  if (!sh || sh.getLastRow() < 2) return {};
+
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(all[0]);
+  const feeCol = hm[normalizeHeaderKey_(CONFIG.HEADERS.feesCost)];
+  if (feeCol === undefined) return {};
+
+  const out = {};
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i];
+    const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
+    if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
+    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
+    if (!month) continue;
+    if (!out[month]) out[month] = { fees: 0 };
+    out[month].fees += parseNumberFlexible_(r[feeCol]);
+  }
+
+  return out;
 }
 
 function buildSalesTaxMonthlyAgg_() {
@@ -4192,12 +4271,12 @@ function buildSalesTaxMonthlyAgg_() {
     if (!month) continue;
 
     if (!out[month]) out[month] = { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
-    out[month].salesAmount += parseNumberFlexible_(valueByHeader_(r, hm, 'Net Sales Total') || valueByHeader_(r, hm, 'Sales Amount'));
-    out[month].vatPayable += parseNumberFlexible_(valueByHeader_(r, hm, 'VAT Total') || valueByHeader_(r, hm, 'VAT Payable'));
-    out[month].grossSales += parseNumberFlexible_(valueByHeader_(r, hm, 'Gross Sales Total') || valueByHeader_(r, hm, 'Gross Sales'));
+    out[month].salesAmount += parseNumberFlexible_(valueByHeader_(r, hm, 'Net Sales Total'));
+    out[month].vatPayable += parseNumberFlexible_(valueByHeader_(r, hm, 'VAT Total'));
+    out[month].grossSales += parseNumberFlexible_(valueByHeader_(r, hm, 'Gross Sales Total'));
     out[month].rows += 1;
 
-    const fid = String(valueByHeader_(r, hm, 'Import File ID') || valueByHeader_(r, hm, 'Source File ID') || '').trim();
+    const fid = String(valueByHeader_(r, hm, 'Import File ID') || '').trim();
     if (fid) out[month].fileIds[fid] = true;
   }
 
@@ -4241,54 +4320,98 @@ function writeDiagnostics_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const cogsByMonth = buildSettlementCogsByMonth_();
+  const settlementFees = buildSettlementFeesByMonth_();
+  const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
 
-  rows.push(['INFO', 'A. Імпортовані sales файли', 'File ID', 'File Name', 'Rows Imported', 'First Month', 'Last Month', 'Imported At', '']);
+  rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'File Name', 'Month', 'Payout', 'COGS', 'Fees', '']);
+  const settlementFiles = buildSettlementFilesRegistry_();
+  const settlementIds = Object.keys(settlementFiles).sort();
+  for (let i = 0; i < settlementIds.length; i++) {
+    const fid = settlementIds[i];
+    const it = settlementFiles[fid];
+    rows.push(['DATA', 'A. Імпортовані settlement файли', fid, it.fileName, it.month, it.payout, it.cogs, it.fees, '']);
+  }
+
+  rows.push(['INFO', 'B. Імпортовані sales файли', 'File ID', 'File Name', 'Rows Imported', 'First Month', 'Last Month', 'Imported At', '']);
   const salesFiles = buildSalesFilesRegistry_();
   const salesFileIds = Object.keys(salesFiles).sort();
-  for (let i = 0; i < salesFileIds.length; i++) {
-    const fid = salesFileIds[i];
-    const it = salesFiles[fid];
-    rows.push(['DATA', 'A. Імпортовані sales файли', fid, it.fileName, it.rows, it.firstMonth, it.lastMonth, Object.keys(it.importedAtSet).sort().join(' | '), '']);
+  for (let j = 0; j < salesFileIds.length; j++) {
+    const sfid = salesFileIds[j];
+    const sit = salesFiles[sfid];
+    rows.push(['DATA', 'B. Імпортовані sales файли', sfid, sit.fileName, sit.rows, sit.firstMonth, sit.lastMonth, Object.keys(sit.importedAtSet).sort().join(' | '), '']);
   }
 
-  rows.push(['INFO', 'B. Settlement summary by month', 'Month', 'payout sum', 'COGS sum', 'settlement file count', '', '', '']);
-  const settlementMonths = Object.keys(payoutByMonth).sort();
-  for (let j = 0; j < settlementMonths.length; j++) {
-    const m = settlementMonths[j];
-    rows.push(['DATA', 'B. Settlement summary by month', m, payoutByMonth[m].paidOut, (cogsByMonth[m] || { cogs: 0 }).cogs, Object.keys(payoutByMonth[m].fileIds || {}).length, '', '', '']);
+  rows.push(['INFO', 'C. Month summary', 'Month', 'Payout', 'COGS', 'Settlement Fees', 'VAT Sales', 'Paid VAT', '']);
+  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), Object.keys(manualVat.byMonth)));
+  for (let k = 0; k < months.length; k++) {
+    const m = months[k];
+    rows.push(['DATA', 'C. Month summary', m,
+      (payoutByMonth[m] || { paidOut: 0 }).paidOut,
+      (cogsByMonth[m] || { cogs: 0 }).cogs,
+      (settlementFees[m] || { fees: 0 }).fees,
+      (salesAgg[m] || { vatPayable: 0 }).vatPayable,
+      (manualVat.byMonth[m] || { paidVat: 0 }).paidVat,
+      ''
+    ]);
   }
 
-  rows.push(['INFO', 'C. Manual fees by month', 'Month', 'Amazon Fees Ex VAT', 'Amazon Fees VAT', 'Amazon Fees Gross', 'rows count', 'warnings', '']);
-  const mfMonths = Object.keys(manualFees).sort();
-  for (let k = 0; k < mfMonths.length; k++) {
-    const m2 = mfMonths[k];
-    const mf = manualFees[m2];
-    rows.push(['DATA', 'C. Manual fees by month', m2, mf.amazonFeesExVat, mf.amazonFeesVat, mf.amazonFeesGross, mf.rows, (mf.warnings || []).join('; '), '']);
-  }
-
-  rows.push(['INFO', 'D. VAT summary', 'Month', 'VAT on Sales', 'VAT on Amazon Fees', 'Net VAT to Pay', '', '', '']);
-  const vatMonths = mergeMonthKeys_(Object.keys(salesAgg), Object.keys(manualFees));
+  rows.push(['INFO', 'D. Manual VAT rows by month', 'Month', 'Paid VAT', 'Rows', 'Warnings', '', '', '']);
+  const vatMonths = Object.keys(manualVat.byMonth).sort();
   for (let x = 0; x < vatMonths.length; x++) {
     const vm = vatMonths[x];
-    const vatSales = (salesAgg[vm] || { vatPayable: 0 }).vatPayable;
-    const vatFees = (manualFees[vm] || { amazonFeesVat: 0 }).amazonFeesVat;
-    rows.push(['DATA', 'D. VAT summary', vm, vatSales, vatFees, vatSales - vatFees, '', '', '']);
+    const v = manualVat.byMonth[vm];
+    rows.push(['DATA', 'D. Manual VAT rows by month', vm, v.paidVat, v.rows, '', '', '', '']);
+  }
+
+  rows.push(['INFO', 'E. Manual fees rows by month', 'Month', 'Fees', 'Rows', 'Warnings', '', '', '']);
+  const feeMonths = Object.keys(manualFees.byMonth).sort();
+  for (let y = 0; y < feeMonths.length; y++) {
+    const fm = feeMonths[y];
+    const f = manualFees.byMonth[fm];
+    rows.push(['DATA', 'E. Manual fees rows by month', fm, f.fees, f.rows, '', '', '', '']);
   }
 
   const unique = buildSalesTaxUniques_();
-  rows.push(['INFO', 'E. Унікальні значення', 'tax rates', unique.taxRates.join(', '), '', '', '', '', '']);
-  rows.push(['INFO', 'E. Унікальні значення', 'ship-to countries', unique.shipToCountries.join(', '), '', '', '', '', '']);
-  rows.push(['INFO', 'E. Унікальні значення', 'tax collection responsibility', unique.taxCollectionResponsibility.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'F. Унікальні значення', 'tax rates', unique.taxRates.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'F. Унікальні значення', 'ship-to countries', unique.shipToCountries.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'F. Унікальні значення', 'tax collection responsibility', unique.taxCollectionResponsibility.join(', '), '', '', '', '', '']);
+
+  const allWarnings = [].concat(manualVat.warnings || [], manualFees.warnings || []);
+  for (let z = 0; z < allWarnings.length; z++) {
+    rows.push(['WARN', 'G. Warnings', allWarnings[z], '', '', '', '', '', '']);
+  }
 
   const sh = getOrCreateSheet_(CONFIG.DIAGNOSTICS_SHEET);
   sh.clearContents();
   sh.getRange(1, 1, 1, 9).setValues([['Level', 'Section', 'Col1', 'Col2', 'Col3', 'Col4', 'Col5', 'Col6', 'Col7']]);
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, 9).setValues(rows);
-  }
+  if (rows.length) sh.getRange(2, 1, rows.length, 9).setValues(rows);
 
   return rows;
+}
+
+function buildSettlementFilesRegistry_() {
+  const out = {};
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
+  if (!sh || sh.getLastRow() < 2) return out;
+
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(all[0]);
+
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i];
+    const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
+    if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
+    out[fid] = {
+      fileName: String(valueByHeader_(r, hm, CONFIG.HEADERS.fileName) || ''),
+      month: monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1),
+      payout: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.transfer)),
+      cogs: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.cogs)),
+      fees: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.feesCost))
+    };
+  }
+
+  return out;
 }
 
 function buildSalesFilesRegistry_() {
