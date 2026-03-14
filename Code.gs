@@ -636,21 +636,26 @@ function importSettlementTxtFile_(fileId, options) {
   const content = file.getBlob().getDataAsString('UTF-8');
 
   const parsed = parseSettlementTsv_(content, costMap, fileMeta, warnings);
-  const rowData = parsed.rowData;
-
-  rowData[CONFIG.HEADERS.fileName] = fileName;
-  rowData[CONFIG.HEADERS.fileId] = fileId;
-  rowData[CONFIG.HEADERS.importedAt] = new Date();
-  rowData[CONFIG.HEADERS.auditStatus] = 'START';
-  rowData[CONFIG.HEADERS.auditUrl] = '';
-
-  const rowValues = buildRowFromHeaderMap_(hm, rowData);
-  const rowIndex = findOrCreateRowByFileId_(sh, hm, ctx.fileIdRowMap, fileId);
+  const importedAt = new Date();
+  const rowIndexes = [];
 
   if (!options.auditOnly) {
-    sh.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
-    runNonCritical_('formatSummaryRow_', function() {
-      formatSummaryRow_(sh, hm, rowIndex, warnings);
+    for (let b = 0; b < parsed.summaryRows.length; b++) {
+      const rowData = parsed.summaryRows[b].rowData;
+      rowData[CONFIG.HEADERS.fileName] = fileName;
+      rowData[CONFIG.HEADERS.fileId] = fileId;
+      rowData[CONFIG.HEADERS.importedAt] = importedAt;
+      rowData[CONFIG.HEADERS.auditStatus] = 'START';
+      rowData[CONFIG.HEADERS.auditUrl] = '';
+
+      const rowValues = buildRowFromHeaderMap_(hm, rowData);
+      const rowIndex = findOrCreateRowBySettlementMonth_(sh, hm, fileId, parsed.settlementId, parsed.summaryRows[b].monthKey);
+      sh.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+      rowIndexes.push(rowIndex);
+    }
+
+    runNonCritical_('formatSummaryRows_', function() {
+      for (let i = 0; i < rowIndexes.length; i++) formatSummaryRow_(sh, hm, rowIndexes[i], warnings);
     }, warnings);
   }
 
@@ -667,11 +672,15 @@ function importSettlementTxtFile_(fileId, options) {
   }
 
   const auditStatus = auditResult.url ? ('CREATED:' + auditResult.url) : String(auditResult.status || 'ERR:UNKNOWN');
-  writeAuditMetaToSummary_(sh, hm, rowIndex, auditResult.url || '', auditStatus);
+  if (!options.auditOnly) {
+    for (let i = 0; i < rowIndexes.length; i++) {
+      writeAuditMetaToSummary_(sh, hm, rowIndexes[i], auditResult.url || '', auditStatus);
+    }
+  }
 
   if (!options.auditOnly) {
     runNonCritical_('applyRowCheckAtRow_', function() {
-      applyRowCheckAtRow_(sh, hm, rowIndex);
+      for (let i = 0; i < rowIndexes.length; i++) applyRowCheckAtRow_(sh, hm, rowIndexes[i]);
     }, warnings);
 
     if (!options.skipPostImportRebuild) {
@@ -688,8 +697,10 @@ function importSettlementTxtFile_(fileId, options) {
     'Імпортовано: ' + fileName,
     'Settlement ID: ' + parsed.settlementId,
     'Deposit Date: ' + Utilities.formatDate(parsed.depositDate, CONFIG.TZ, 'yyyy-MM-dd'),
-    'Effective Posted Date: ' + Utilities.formatDate(parsed.postedDate, CONFIG.TZ, 'yyyy-MM-dd') + ' (' + parsed.postedDateSource + ')',
-    'Assigned Month: ' + Utilities.formatDate(parsed.monthDate, CONFIG.TZ, 'yyyy-MM'),
+    'Settlement split mode: ROW-LEVEL BY POSTED DATE',
+    'Bucket Months Found: ' + parsed.bucketMonths.join(', '),
+    'Assigned via POSTED_DATE: ' + parsed.assignmentStats.postedDateRows + ', DEPOSIT_FALLBACK: ' + parsed.assignmentStats.depositFallbackRows,
+    'Split Integrity Check: ' + parsed.splitIntegrity.status + ' (diff ' + fromCents_(parsed.splitIntegrity.diffC).toFixed(2) + ')',
     'Sales: ' + fromCents_(parsed.salesC).toFixed(2),
     'VAT: ' + fromCents_(parsed.vatC).toFixed(2),
     'Fees: ' + fromCents_(parsed.feesExpenseC).toFixed(2),
@@ -701,6 +712,7 @@ function importSettlementTxtFile_(fileId, options) {
     'Company Profit: ' + fromCents_(parsed.companyProfitC).toFixed(2),
     'Sold Profit: ' + fromCents_(parsed.soldProfitC).toFixed(2),
     'Row Check: ' + parsed.rowCheck,
+    'Summary rows upserted: ' + parsed.summaryRows.length,
     'Audit Status: ' + auditStatus
   ].join('\n');
 
@@ -834,23 +846,29 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
   }
 
   const effectivePosted = resolveSettlementEffectiveDate_(dataRows, idx, depositDate, dateReference);
-  const postedDate = effectivePosted.date;
-  const monthDate = new Date(Date.UTC(postedDate.getUTCFullYear(), postedDate.getUTCMonth(), 1));
+
+  const orderAgg = Object.create(null);
+  const rawRows = [];
+  const bucketBuild = buildSettlementMonthlyBuckets_(dataRows, idx, depositDate, dateReference);
+  const bucketMonths = Object.keys(bucketBuild.buckets).sort();
+  if (!bucketMonths.length) {
+    const fallbackMonth = Utilities.formatDate(new Date(Date.UTC(depositDate.getUTCFullYear(), depositDate.getUTCMonth(), 1)), CONFIG.TZ, 'yyyy-MM');
+    bucketBuild.buckets[fallbackMonth] = { monthKey: fallbackMonth, rows: [] };
+    bucketMonths.push(fallbackMonth);
+  }
 
   let salesC = 0;
   let vatC = 0;
-  let itemFeesSignedSumC = 0;
-  let feeNeg = 0;
-  let feePos = 0;
+  let feesExpenseC = 0;
   let reimbursementsC = 0;
-
-  const skuQtyMap = Object.create(null);
-  const orderAgg = Object.create(null);
-  const rawRows = [];
-
-  const idxOrderId = idx['order-id'];
-  const idxSku = idx['sku'];
-  const idxQty = idx['quantity-purchased'];
+  let otherC = 0;
+  let transferBucketsSumC = 0;
+  let cogsTotalC = 0;
+  let unitsTotal = 0;
+  let unitsWithCostTotal = 0;
+  let missingUnitsTotal = 0;
+  const missingSkuSet = new Set();
+  const summaryRows = [];
 
   for (let i = 0; i < dataRows.length; i++) {
     const row = dataRows[i];
@@ -867,27 +885,14 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
 
     if (rawRows.length < CONFIG.AUDIT.RAW_LINES_LIMIT) rawRows.push(row);
 
-    if (isReimbursementLine_(transactionType, amountType, amountDesc)) reimbursementsC += amountC;
-
     const t = String(amountType || '').trim();
     const d = String(amountDesc || '').trim();
-
-    if (t === 'ItemPrice') {
-      if (d === 'Principal' || d === 'Shipping' || d === 'GiftWrap') salesC += amountC;
-      else if (d === 'Tax' || d === 'ShippingTax' || d === 'GiftWrapTax') vatC += amountC;
-    }
-
-    if (t === 'ItemFees' || t === 'Fees') {
-      itemFeesSignedSumC += amountC;
-      if (amountC < 0) feeNeg++;
-      if (amountC > 0) feePos++;
-    }
-
+    const idxOrderId = idx['order-id'];
+    const idxSku = idx['sku'];
+    const idxQty = idx['quantity-purchased'];
     const sku = idxSku !== undefined ? normalizeSku_(row[idxSku]) : '';
     const qty = idxQty !== undefined ? Math.max(0, Math.round(parseNumberLoose_(row[idxQty]))) : 0;
     const orderId = idxOrderId !== undefined ? String(row[idxOrderId] || '').trim() : '';
-
-    if (t === 'ItemPrice' && d === 'Principal' && sku && qty > 0) skuQtyMap[sku] = (skuQtyMap[sku] || 0) + qty;
 
     if (sku || orderId) {
       const k = orderId + '||' + sku;
@@ -903,50 +908,45 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     }
   }
 
-  const feesNorm = normalizeFeesExpenseC_(itemFeesSignedSumC, feeNeg, feePos);
-  const feesExpenseC = feesNorm.feesExpenseC;
+  for (let m = 0; m < bucketMonths.length; m++) {
+    const monthKey = bucketMonths[m];
+    const bucket = bucketBuild.buckets[monthKey];
+    const agg = aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName);
+    summaryRows.push({ monthKey: monthKey, rowData: agg.rowData, stats: agg.stats });
 
-  const units = Object.keys(skuQtyMap).reduce(function(acc, sku) { return acc + Number(skuQtyMap[sku] || 0); }, 0);
-  const cogsRes = calcCogsFromCostMap_(skuQtyMap, costMap);
+    salesC += agg.salesC;
+    vatC += agg.vatC;
+    feesExpenseC += agg.feesExpenseC;
+    reimbursementsC += agg.reimbursementsC;
+    otherC += agg.otherC;
+    transferBucketsSumC += agg.transferC;
+    cogsTotalC += agg.cogsRes.cogsC;
+    unitsTotal += agg.units;
+    unitsWithCostTotal += agg.cogsRes.unitsWithCost;
+    missingUnitsTotal += agg.cogsRes.missingUnits;
+    (agg.cogsRes.missingSkus || []).forEach(function(sku) { if (sku) missingSkuSet.add(sku); });
+  }
 
-  const otherC = transferC - (salesC + vatC - feesExpenseC);
-  const payoutExReimbC = transferC - reimbursementsC;
-  const netCashC = transferC - cogsRes.cogsC;
-  const soldProfitC = payoutExReimbC - cogsRes.cogsC;
+  const transferDiffC = transferC - transferBucketsSumC;
+  if (transferDiffC !== 0 && summaryRows.length) {
+    const first = summaryRows[0].rowData;
+    const firstTransfer = toCents_(parseNumberFlexible_(first[CONFIG.HEADERS.transfer]));
+    const firstOther = toCents_(parseNumberFlexible_(first[CONFIG.HEADERS.otherNet]));
+    first[CONFIG.HEADERS.transfer] = fromCents_(firstTransfer + transferDiffC);
+    first[CONFIG.HEADERS.otherNet] = fromCents_(firstOther + transferDiffC);
+    transferBucketsSumC += transferDiffC;
+    otherC += transferDiffC;
+  }
+
+  const payoutExReimbC = transferBucketsSumC - reimbursementsC;
+  const netCashC = transferBucketsSumC - cogsTotalC;
+  const soldProfitC = payoutExReimbC - cogsTotalC;
   const profitExReimbC = soldProfitC;
   const companyProfitC = netCashC;
 
-  const diffC = (salesC + vatC + otherC - feesExpenseC) - transferC;
+  const diffC = (salesC + vatC + otherC - feesExpenseC) - transferBucketsSumC;
   const rowCheck = Math.abs(diffC) <= 1 ? 'OK' : ('ERR diff ' + fromCents_(diffC).toFixed(2));
-
-  const rowData = {};
-  rowData[CONFIG.HEADERS.depositDate] = depositDate;
-  rowData[CONFIG.HEADERS.postedDate] = postedDate;
-  rowData[CONFIG.HEADERS.month] = monthDate;
-  rowData[CONFIG.HEADERS.settlementId] = settlementId;
-  rowData[CONFIG.HEADERS.marketplace] = marketplaceName ? mapMarketplace_(marketplaceName) : '';
-  rowData[CONFIG.HEADERS.units] = units;
-
-  rowData[CONFIG.HEADERS.salesNet] = fromCents_(salesC);
-  rowData[CONFIG.HEADERS.vatDebito] = fromCents_(vatC);
-  rowData[CONFIG.HEADERS.feesCost] = fromCents_(feesExpenseC);
-  rowData[CONFIG.HEADERS.otherNet] = fromCents_(otherC);
-  rowData[CONFIG.HEADERS.transfer] = fromCents_(transferC);
-  rowData[CONFIG.HEADERS.payoutExReimbursements] = fromCents_(payoutExReimbC);
-
-  rowData[CONFIG.HEADERS.cogs] = fromCents_(cogsRes.cogsC);
-  rowData[CONFIG.HEADERS.netProfit] = fromCents_(netCashC);
-  rowData[CONFIG.HEADERS.amazonReimbursements] = fromCents_(reimbursementsC);
-  rowData[CONFIG.HEADERS.soldProfit] = fromCents_(soldProfitC);
-  rowData[CONFIG.HEADERS.profitExReimbursements] = fromCents_(profitExReimbC);
-  rowData[CONFIG.HEADERS.companyProfit] = fromCents_(companyProfitC);
-
-  rowData[CONFIG.HEADERS.unitsWithCost] = cogsRes.unitsWithCost;
-  rowData[CONFIG.HEADERS.missingUnits] = cogsRes.missingUnits;
-  rowData[CONFIG.HEADERS.cogsCoverage] = cogsRes.coveragePct;
-  rowData[CONFIG.HEADERS.cogsStatus] = cogsRes.missingUnits > 0 ? 'MISSING_COST' : 'OK';
-  rowData[CONFIG.HEADERS.missingSkus] = cogsRes.missingSkusText;
-  rowData[CONFIG.HEADERS.rowCheck] = rowCheck;
+  const splitIntegrityDiffC = transferC - transferBucketsSumC;
 
   return {
     header: header,
@@ -954,17 +954,20 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     idx: idx,
     settlementId: settlementId,
     depositDate: depositDate,
-    postedDate: postedDate,
+    postedDate: effectivePosted.date,
     postedDateSource: effectivePosted.source,
     postedDateCandidates: effectivePosted.candidates,
-    monthDate: monthDate,
+    monthDate: new Date(Date.UTC(effectivePosted.date.getUTCFullYear(), effectivePosted.date.getUTCMonth(), 1)),
+    bucketMonths: bucketMonths,
+    assignmentStats: bucketBuild.stats,
+    splitIntegrity: { status: Math.abs(splitIntegrityDiffC) <= 1 ? 'OK' : 'FAIL', diffC: splitIntegrityDiffC },
     marketplaceName: marketplaceName,
-    transferC: transferC,
+    transferC: transferBucketsSumC,
     payoutExReimbC: payoutExReimbC,
     salesC: salesC,
     vatC: vatC,
     feesExpenseC: feesExpenseC,
-    feesRule: feesNorm.feesRule,
+    feesRule: 'split-by-month bucket aggregation',
     reimbursementsC: reimbursementsC,
     otherC: otherC,
     soldProfitC: soldProfitC,
@@ -972,10 +975,147 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     companyProfitC: companyProfitC,
     rowCheck: rowCheck,
     orderAgg: orderAgg,
-    skuQtyMap: skuQtyMap,
+    skuQtyMap: {},
+    cogsRes: {
+      cogsC: cogsTotalC,
+      unitsWithCost: unitsWithCostTotal,
+      missingUnits: missingUnitsTotal,
+      coveragePct: unitsTotal > 0 ? (unitsWithCostTotal / unitsTotal) : 1,
+      missingSkus: Array.from(missingSkuSet),
+      missingSkusText: Array.from(missingSkuSet).join(', ')
+    },
+    units: unitsTotal,
+    summaryRows: summaryRows,
+    rowData: summaryRows.length ? summaryRows[0].rowData : {}
+  };
+}
+
+function resolveRowMonthKey_(row, idx, fallbackDepositDate, referenceDate, stats) {
+  const postedRaw = cellByHeader_(row, idx, 'posted-date');
+  const posted = parseDateFlexible_(postedRaw, CONFIG.TZ, { referenceDate: referenceDate });
+  if (posted instanceof Date && !isNaN(posted.getTime())) {
+    if (stats) stats.postedDateRows += 1;
+    return { monthKey: Utilities.formatDate(posted, CONFIG.TZ, 'yyyy-MM'), postedDate: posted, source: 'POSTED_DATE' };
+  }
+  if (stats) stats.depositFallbackRows += 1;
+  return {
+    monthKey: Utilities.formatDate(fallbackDepositDate, CONFIG.TZ, 'yyyy-MM'),
+    postedDate: fallbackDepositDate,
+    source: 'DEPOSIT_FALLBACK'
+  };
+}
+
+function buildSettlementMonthlyBuckets_(rows, idx, fallbackDepositDate, referenceDate) {
+  const out = {};
+  const stats = { postedDateRows: 0, depositFallbackRows: 0 };
+  for (let i = 0; i < (rows || []).length; i++) {
+    const row = rows[i];
+    const info = resolveRowMonthKey_(row, idx, fallbackDepositDate, referenceDate, stats);
+    if (!out[info.monthKey]) out[info.monthKey] = { monthKey: info.monthKey, rows: [], postedDateRows: 0, depositFallbackRows: 0 };
+    out[info.monthKey].rows.push(row);
+    if (info.source === 'POSTED_DATE') out[info.monthKey].postedDateRows += 1;
+    else out[info.monthKey].depositFallbackRows += 1;
+  }
+  return { buckets: out, stats: stats };
+}
+
+function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName) {
+  const rows = bucket && bucket.rows ? bucket.rows : [];
+  const monthParts = String(bucket.monthKey || '').split('-');
+  const monthDate = new Date(Date.UTC(Number(monthParts[0] || 1970), Number(monthParts[1] || 1) - 1, 1));
+
+  let transferC = 0;
+  let salesC = 0;
+  let vatC = 0;
+  let itemFeesSignedSumC = 0;
+  let feeNeg = 0;
+  let feePos = 0;
+  let reimbursementsC = 0;
+  const skuQtyMap = Object.create(null);
+
+  const idxSku = idx['sku'];
+  const idxQty = idx['quantity-purchased'];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const amountType = cellByHeader_(row, idx, 'amount-type');
+    const amountDesc = cellByHeader_(row, idx, 'amount-description');
+    const transactionType = cellByHeader_(row, idx, 'transaction-type');
+    const amountC = toCents_(parseNumberLoose_(cellByHeader_(row, idx, 'amount')));
+    transferC += amountC;
+
+    if (isReimbursementLine_(transactionType, amountType, amountDesc)) reimbursementsC += amountC;
+
+    const t = String(amountType || '').trim();
+    const d = String(amountDesc || '').trim();
+    if (t === 'ItemPrice') {
+      if (d === 'Principal' || d === 'Shipping' || d === 'GiftWrap') salesC += amountC;
+      else if (d === 'Tax' || d === 'ShippingTax' || d === 'GiftWrapTax') vatC += amountC;
+    }
+    if (t === 'ItemFees' || t === 'Fees') {
+      itemFeesSignedSumC += amountC;
+      if (amountC < 0) feeNeg++;
+      if (amountC > 0) feePos++;
+    }
+
+    const sku = idxSku !== undefined ? normalizeSku_(row[idxSku]) : '';
+    const qty = idxQty !== undefined ? Math.max(0, Math.round(parseNumberLoose_(row[idxQty]))) : 0;
+    if (t === 'ItemPrice' && d === 'Principal' && sku && qty > 0) skuQtyMap[sku] = (skuQtyMap[sku] || 0) + qty;
+  }
+
+  const feesNorm = normalizeFeesExpenseC_(itemFeesSignedSumC, feeNeg, feePos);
+  const feesExpenseC = feesNorm.feesExpenseC;
+  const cogsRes = calcCogsFromCostMap_(skuQtyMap, costMap);
+  const units = Object.keys(skuQtyMap).reduce(function(acc, sku) { return acc + Number(skuQtyMap[sku] || 0); }, 0);
+
+  const otherC = transferC - (salesC + vatC - feesExpenseC);
+  const payoutExReimbC = transferC - reimbursementsC;
+  const netCashC = transferC - cogsRes.cogsC;
+  const soldProfitC = payoutExReimbC - cogsRes.cogsC;
+  const profitExReimbC = soldProfitC;
+  const companyProfitC = netCashC;
+  const diffC = (salesC + vatC + otherC - feesExpenseC) - transferC;
+  const rowCheck = Math.abs(diffC) <= 1 ? 'OK' : ('ERR diff ' + fromCents_(diffC).toFixed(2));
+
+  const rowData = {};
+  rowData[CONFIG.HEADERS.depositDate] = depositDate;
+  rowData[CONFIG.HEADERS.postedDate] = monthDate;
+  rowData[CONFIG.HEADERS.month] = monthDate;
+  rowData[CONFIG.HEADERS.settlementId] = settlementId;
+  rowData[CONFIG.HEADERS.marketplace] = marketplaceName ? mapMarketplace_(marketplaceName) : '';
+  rowData[CONFIG.HEADERS.units] = units;
+  rowData[CONFIG.HEADERS.salesNet] = fromCents_(salesC);
+  rowData[CONFIG.HEADERS.vatDebito] = fromCents_(vatC);
+  rowData[CONFIG.HEADERS.feesCost] = fromCents_(feesExpenseC);
+  rowData[CONFIG.HEADERS.otherNet] = fromCents_(otherC);
+  rowData[CONFIG.HEADERS.transfer] = fromCents_(transferC);
+  rowData[CONFIG.HEADERS.payoutExReimbursements] = fromCents_(payoutExReimbC);
+  rowData[CONFIG.HEADERS.cogs] = fromCents_(cogsRes.cogsC);
+  rowData[CONFIG.HEADERS.netProfit] = fromCents_(netCashC);
+  rowData[CONFIG.HEADERS.amazonReimbursements] = fromCents_(reimbursementsC);
+  rowData[CONFIG.HEADERS.soldProfit] = fromCents_(soldProfitC);
+  rowData[CONFIG.HEADERS.profitExReimbursements] = fromCents_(profitExReimbC);
+  rowData[CONFIG.HEADERS.companyProfit] = fromCents_(companyProfitC);
+  rowData[CONFIG.HEADERS.unitsWithCost] = cogsRes.unitsWithCost;
+  rowData[CONFIG.HEADERS.missingUnits] = cogsRes.missingUnits;
+  rowData[CONFIG.HEADERS.cogsCoverage] = cogsRes.coveragePct;
+  rowData[CONFIG.HEADERS.cogsStatus] = cogsRes.missingUnits > 0 ? 'MISSING_COST' : 'OK';
+  rowData[CONFIG.HEADERS.missingSkus] = cogsRes.missingSkusText;
+  rowData[CONFIG.HEADERS.rowCheck] = rowCheck + ' | split ' + bucket.monthKey + ' rows:' + rows.length + ' posted:' + (bucket.postedDateRows || 0) + ' fallback:' + (bucket.depositFallbackRows || 0);
+
+  return {
+    monthKey: bucket.monthKey,
+    transferC: transferC,
+    salesC: salesC,
+    vatC: vatC,
+    feesExpenseC: feesExpenseC,
+    reimbursementsC: reimbursementsC,
+    otherC: otherC,
+    payoutExReimbC: payoutExReimbC,
     cogsRes: cogsRes,
     units: units,
-    rowData: rowData
+    rowData: rowData,
+    stats: { rows: rows.length, postedDateRows: bucket.postedDateRows || 0, depositFallbackRows: bucket.depositFallbackRows || 0 }
   };
 }
 
@@ -1470,6 +1610,30 @@ function findOrCreateRowByFileId_(sh, hm, fileIdRowMap, fileId) {
   row = findFirstEmptyRow_(sh, hm[CONFIG.HEADERS.fileId], 2);
   fileIdRowMap.set(key, row);
   return row;
+}
+
+function findOrCreateRowBySettlementMonth_(sh, hm, fileId, settlementId, monthKey) {
+  const colFileId = hm[CONFIG.HEADERS.fileId];
+  const colSettlementId = hm[CONFIG.HEADERS.settlementId];
+  const colMonth = hm[CONFIG.HEADERS.month];
+  if (!colFileId || !colSettlementId || !colMonth) return findFirstEmptyRow_(sh, hm[CONFIG.HEADERS.fileId], 2);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) {
+    const values = sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues();
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const existingFileId = String(row[colFileId - 1] || '').trim();
+      if (!existingFileId || existingFileId === CONFIG.TOTAL_FILE_ID) continue;
+      const existingSettlementId = String(row[colSettlementId - 1] || '').trim();
+      const existingMonth = toMonthText_(row[colMonth - 1]);
+      if (existingFileId === String(fileId || '').trim() && existingSettlementId === String(settlementId || '').trim() && existingMonth === monthKey) {
+        return 2 + i;
+      }
+    }
+  }
+
+  return findFirstEmptyRow_(sh, hm[CONFIG.HEADERS.fileId], 2);
 }
 
 function buildFileIdRowIndexMap_(sheet, colFileId) {
@@ -4319,15 +4483,27 @@ function buildSettlementFilesRegistry_() {
     const r = all[i];
     const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
-    out[fid] = {
-      fileName: String(valueByHeader_(r, hm, CONFIG.HEADERS.fileName) || ''),
-      depositDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.depositDate)),
-      postedDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.postedDate)),
-      month: monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1),
-      payout: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.transfer)),
-      cogs: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.cogs)),
-      fees: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.feesCost))
-    };
+    if (!out[fid]) {
+      out[fid] = {
+        fileName: String(valueByHeader_(r, hm, CONFIG.HEADERS.fileName) || ''),
+        depositDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.depositDate)),
+        postedDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.postedDate)),
+        month: '',
+        payout: 0,
+        cogs: 0,
+        fees: 0,
+        months: {}
+      };
+    }
+
+    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
+    out[fid].payout += parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.transfer));
+    out[fid].cogs += parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.cogs));
+    out[fid].fees += parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.feesCost));
+    if (month) out[fid].months[month] = true;
+
+    const monthList = Object.keys(out[fid].months).sort();
+    out[fid].month = monthList.join(', ');
   }
 
   return out;
