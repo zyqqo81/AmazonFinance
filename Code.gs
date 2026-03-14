@@ -1,11 +1,11 @@
 /***************
- * AMAZON SETTLEMENT IMPORTER (Deposit Date basis) — BALANCED + COGS + AUDIT PACK
+ * AMAZON SETTLEMENT IMPORTER (Posted Date month basis) — BALANCED + COGS + AUDIT PACK
  * Google Sheets + Apps Script
  ***************/
 
 const CONFIG = {
   SUMMARY_SHEET: 'ІМПОРТ – ЗВЕДЕННЯ',
-  MONTHLY_SHEET: 'МІСЯЦІ',
+  MONTHLY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
   PURCHASES_SHEET: 'Закупки',
   TZ: 'Europe/Rome',
   TOTAL_FILE_ID: '__TOTAL__',
@@ -40,6 +40,7 @@ const CONFIG = {
 
   HEADERS: {
     depositDate: 'Deposit Date',
+    postedDate: 'Posted Date',
     month: 'Month',
     settlementId: 'Settlement ID',
     marketplace: 'Країна',
@@ -818,20 +819,22 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
   }
 
   const settlementId = cellByHeader_(firstRow, idx, 'settlement-id');
+  const postedDateRaw = cellByHeader_(firstRow, idx, 'posted-date');
   const depositDateRaw = cellByHeader_(firstRow, idx, 'deposit-date');
   const transferC = detectTransferC_(dataRows, idx, warnings || []);
   let marketplaceName = cellByHeader_(firstRow, idx, 'marketplace-name');
 
-  const depositDate = parseDateFlexible_(depositDateRaw, CONFIG.TZ, {
-    referenceDate: extractDateFromFileName_(fileMeta && fileMeta.name)
-  });
+  const dateReference = extractDateFromFileName_(fileMeta && fileMeta.name);
+  const depositDate = parseDateFlexible_(depositDateRaw, CONFIG.TZ, { referenceDate: dateReference });
   if (!(depositDate instanceof Date) || isNaN(depositDate.getTime())) {
     throw buildFileDiagnosticError_('Не вдалося розпізнати Deposit Date: "' + depositDateRaw + '"', fileMeta, content, header, [
       'Підтримуються формати: YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, з часом/таймзоною.'
     ]);
   }
 
-  const monthDate = new Date(Date.UTC(depositDate.getUTCFullYear(), depositDate.getUTCMonth(), 1));
+  const postedDateParsed = parseDateFlexible_(postedDateRaw, CONFIG.TZ, { referenceDate: dateReference });
+  const postedDate = (postedDateParsed instanceof Date && !isNaN(postedDateParsed.getTime())) ? postedDateParsed : depositDate;
+  const monthDate = new Date(Date.UTC(postedDate.getUTCFullYear(), postedDate.getUTCMonth(), 1));
 
   let salesC = 0;
   let vatC = 0;
@@ -917,6 +920,7 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
 
   const rowData = {};
   rowData[CONFIG.HEADERS.depositDate] = depositDate;
+  rowData[CONFIG.HEADERS.postedDate] = postedDate;
   rowData[CONFIG.HEADERS.month] = monthDate;
   rowData[CONFIG.HEADERS.settlementId] = settlementId;
   rowData[CONFIG.HEADERS.marketplace] = marketplaceName ? mapMarketplace_(marketplaceName) : '';
@@ -949,6 +953,7 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     idx: idx,
     settlementId: settlementId,
     depositDate: depositDate,
+    postedDate: postedDate,
     monthDate: monthDate,
     marketplaceName: marketplaceName,
     transferC: transferC,
@@ -977,152 +982,11 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
 
 function rebuildMonthly_(warnings) {
   warnings = warnings || [];
-  const ss = SpreadsheetApp.getActive();
-  const summary = ss.getSheetByName(CONFIG.SUMMARY_SHEET);
-  if (!summary) throw new Error('Не знайдено вкладку "' + CONFIG.SUMMARY_SHEET + '"');
+  runNonCritical_('rebuildMonthlyVatPayoutSummary_ [migration]', function() {
+    rebuildMonthlyVatPayoutSummary_();
+  }, warnings);
 
-  ensureSummaryHeaders_(summary);
-  const hm = getHeaderMap_(summary);
-
-  const required = [
-    CONFIG.HEADERS.month,
-    CONFIG.HEADERS.fileId,
-    CONFIG.HEADERS.salesNet,
-    CONFIG.HEADERS.vatDebito,
-    CONFIG.HEADERS.feesCost,
-    CONFIG.HEADERS.otherNet,
-    CONFIG.HEADERS.transfer,
-    CONFIG.HEADERS.payoutExReimbursements,
-    CONFIG.HEADERS.units,
-    CONFIG.HEADERS.cogs,
-    CONFIG.HEADERS.netProfit,
-    CONFIG.HEADERS.amazonReimbursements,
-    CONFIG.HEADERS.soldProfit,
-    CONFIG.HEADERS.profitExReimbursements,
-    CONFIG.HEADERS.companyProfit
-  ];
-
-  const missing = required.filter(function(h) { return !hm[h]; });
-  if (missing.length) throw new Error('Не вистачає заголовків: ' + missing.join(', '));
-
-  const monthly = ss.getSheetByName(CONFIG.MONTHLY_SHEET) || ss.insertSheet(CONFIG.MONTHLY_SHEET);
-  monthly.clearContents();
-
-  const headers = [
-    'Month',
-    'Sales',
-    'VAT',
-    'Fees',
-    'Other',
-    'Transfer',
-    'Payout Ex-Reimbursements',
-    'Amazon Reimbursements',
-    'Units',
-    'COGS',
-    'Net Profit (cash)',
-    'Sold Profit',
-    'Profit Ex-Reimbursements',
-    'Company Profit',
-    'Reconcile'
-  ];
-  monthly.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  const lastRow = summary.getLastRow();
-  if (lastRow < 2) return;
-
-  const values = summary.getRange(2, 1, lastRow - 1, summary.getLastColumn()).getValues();
-
-  const c = {
-    month: hm[CONFIG.HEADERS.month] - 1,
-    fileId: hm[CONFIG.HEADERS.fileId] - 1,
-    sales: hm[CONFIG.HEADERS.salesNet] - 1,
-    vat: hm[CONFIG.HEADERS.vatDebito] - 1,
-    fees: hm[CONFIG.HEADERS.feesCost] - 1,
-    other: hm[CONFIG.HEADERS.otherNet] - 1,
-    transfer: hm[CONFIG.HEADERS.transfer] - 1,
-    payoutExReimb: hm[CONFIG.HEADERS.payoutExReimbursements] - 1,
-    reimb: hm[CONFIG.HEADERS.amazonReimbursements] - 1,
-    units: hm[CONFIG.HEADERS.units] - 1,
-    cogs: hm[CONFIG.HEADERS.cogs] - 1,
-    net: hm[CONFIG.HEADERS.netProfit] - 1,
-    sold: hm[CONFIG.HEADERS.soldProfit] - 1,
-    ex: hm[CONFIG.HEADERS.profitExReimbursements] - 1,
-    company: hm[CONFIG.HEADERS.companyProfit] - 1
-  };
-
-  const bucket = Object.create(null);
-
-  for (let i = 0; i < values.length; i++) {
-    const row = values[i];
-    const fid = String(row[c.fileId] || '').trim();
-    if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
-
-    const m = row[c.month];
-    if (!(m instanceof Date) || isNaN(m.getTime())) continue;
-
-    const key = Utilities.formatDate(m, 'UTC', 'yyyy-MM');
-    if (!bucket[key]) {
-      bucket[key] = {
-        monthDate: new Date(Date.UTC(m.getUTCFullYear(), m.getUTCMonth(), 1)),
-        salesC: 0,
-        vatC: 0,
-        feesC: 0,
-        otherC: 0,
-        transferC: 0,
-        payoutExReimbC: 0,
-        reimbC: 0,
-        units: 0,
-        cogsC: 0,
-        netC: 0,
-        soldC: 0,
-        exC: 0,
-        companyC: 0
-      };
-    }
-
-    const b = bucket[key];
-    b.salesC += toCents_(row[c.sales]);
-    b.vatC += toCents_(row[c.vat]);
-    b.feesC += toCents_(row[c.fees]);
-    b.otherC += toCents_(row[c.other]);
-    b.transferC += toCents_(row[c.transfer]);
-    b.payoutExReimbC += toCents_(row[c.payoutExReimb]);
-    b.reimbC += toCents_(row[c.reimb]);
-    b.units += Math.round(Number(row[c.units]) || 0);
-    b.cogsC += toCents_(row[c.cogs]);
-    b.netC += toCents_(row[c.net]);
-    b.soldC += toCents_(row[c.sold]);
-    b.exC += toCents_(row[c.ex]);
-    b.companyC += toCents_(row[c.company]);
-  }
-
-  const keys = Object.keys(bucket).sort();
-  if (!keys.length) return;
-
-  const out = keys.map(function(k) {
-    const b = bucket[k];
-    const diffC = (b.salesC + b.vatC + b.otherC - b.feesC) - b.transferC;
-    return [
-      b.monthDate,
-      fromCents_(b.salesC),
-      fromCents_(b.vatC),
-      fromCents_(b.feesC),
-      fromCents_(b.otherC),
-      fromCents_(b.transferC),
-      fromCents_(b.payoutExReimbC),
-      fromCents_(b.reimbC),
-      b.units,
-      fromCents_(b.cogsC),
-      fromCents_(b.netC),
-      fromCents_(b.soldC),
-      fromCents_(b.exC),
-      fromCents_(b.companyC),
-      Math.abs(diffC) <= 1 ? 'OK' : ('ERR ' + fromCents_(diffC).toFixed(2))
-    ];
-  });
-
-  monthly.getRange(2, 1, out.length, headers.length).setValues(out);
-  applyMonthlyFormats_(monthly, out.length, warnings);
+  migrateLegacyMonthlySheetToMain_();
 }
 
 function rebuildMonthlySheet_() {
@@ -1154,6 +1018,24 @@ function validateSummarySheet_() {
   }
 }
 
+function migrateLegacyMonthlySheetToMain_() {
+  const ss = SpreadsheetApp.getActive();
+  const mainName = CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET;
+  const legacyName = 'МІСЯЦІ';
+  const main = ss.getSheetByName(mainName);
+  const legacy = ss.getSheetByName(legacyName);
+  if (!legacy) return;
+
+  if (!main) {
+    legacy.setName(mainName);
+    return;
+  }
+
+  if (legacy.getSheetId() !== main.getSheetId()) {
+    legacy.hideSheet();
+  }
+}
+
 function ensureMonthAndTotals_(warnings) {
   warnings = warnings || [];
   const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
@@ -1164,9 +1046,10 @@ function ensureMonthAndTotals_(warnings) {
 
   const colFileId = hm[CONFIG.HEADERS.fileId];
   const colMonth = hm[CONFIG.HEADERS.month];
+  const colPosted = hm[CONFIG.HEADERS.postedDate];
   const colDeposit = hm[CONFIG.HEADERS.depositDate];
   const colSettlId = hm[CONFIG.HEADERS.settlementId];
-  if (!colFileId || !colMonth || !colDeposit) return;
+  if (!colFileId || !colMonth || (!colPosted && !colDeposit)) return;
 
   let lastRow = sh.getLastRow();
   if (lastRow < 2) return;
@@ -1180,7 +1063,8 @@ function ensureMonthAndTotals_(warnings) {
   if (lastRow < 2) return;
 
   const ids = sh.getRange(2, colFileId, lastRow - 1, 1).getValues();
-  const deposits = sh.getRange(2, colDeposit, lastRow - 1, 1).getValues();
+  const postedVals = colPosted ? sh.getRange(2, colPosted, lastRow - 1, 1).getValues() : [];
+  const deposits = colDeposit ? sh.getRange(2, colDeposit, lastRow - 1, 1).getValues() : [];
 
   let lastDataRow = 1;
   const monthVals = [];
@@ -1192,9 +1076,11 @@ function ensureMonthAndTotals_(warnings) {
       continue;
     }
 
-    const d = deposits[i][0];
-    if (d instanceof Date && !isNaN(d.getTime())) {
-      monthVals.push([new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1))]);
+    const p = colPosted ? postedVals[i][0] : '';
+    const d = colDeposit ? deposits[i][0] : '';
+    const basis = (p instanceof Date && !isNaN(p.getTime())) ? p : d;
+    if (basis instanceof Date && !isNaN(basis.getTime())) {
+      monthVals.push([new Date(Date.UTC(basis.getUTCFullYear(), basis.getUTCMonth(), 1))]);
       lastDataRow = 2 + i;
     } else {
       monthVals.push(['']);
@@ -2021,7 +1907,7 @@ function parseTsv_(text, fileMeta) {
 
   const headers = safeSplitTsv_(lines[headerRowIndex]);
   const idx = indexMapFlexible_(headers, true);
-  const essential = ['settlement-id', 'deposit-date', 'amount-type', 'amount-description', 'transaction-type', 'amount'];
+  const essential = ['settlement-id', 'amount-type', 'amount-description', 'transaction-type', 'amount'];
   const missing = essential.filter(function(k) { return idx[k] === undefined; });
   if (missing.length) {
     throw buildFileDiagnosticError_('Не знайдені required headers: ' + missing.join(', '), fileMeta, raw, headers, []);
@@ -2074,6 +1960,7 @@ function normalizeHeader_(h) {
 function indexMapFlexible_(headers, skipRequiredCheck) {
   const aliases = {
     'settlement-id': ['settlement-id', 'settlementid'],
+    'posted-date': ['posted-date', 'posted-date-time', 'posteddate', 'posteddatetime'],
     'deposit-date': ['deposit-date', 'deposit-date-time', 'depositdate', 'depositdatetime'],
     'total-amount': ['total-amount', 'totalamount', 'total amount'],
     'amount-type': ['amount-type', 'amounttype'],
@@ -2106,7 +1993,7 @@ function indexMapFlexible_(headers, skipRequiredCheck) {
   });
 
   if (!skipRequiredCheck) {
-    ['settlement-id', 'deposit-date', 'amount-type', 'amount-description', 'amount'].forEach(function(k) {
+    ['settlement-id', 'amount-type', 'amount-description', 'amount'].forEach(function(k) {
       if (map[k] === undefined) throw new Error('Missing column in settlement header: ' + k);
     });
   }
@@ -2287,7 +2174,7 @@ function applySummaryFormats_(sheet, hm, startRow, rowCount, warnings) {
   warnings = warnings || [];
   if (!sheet || !hm || !startRow || rowCount <= 0) return;
 
-  const dateCols = [hm[CONFIG.HEADERS.depositDate], hm[CONFIG.HEADERS.month], hm[CONFIG.HEADERS.importedAt]].filter(Boolean);
+  const dateCols = [hm[CONFIG.HEADERS.depositDate], hm[CONFIG.HEADERS.postedDate], hm[CONFIG.HEADERS.month], hm[CONFIG.HEADERS.importedAt]].filter(Boolean);
   for (let i = 0; i < dateCols.length; i++) {
     const col = dateCols[i];
     const fmt = col === hm[CONFIG.HEADERS.month] ? 'yyyy-MM' : (col === hm[CONFIG.HEADERS.importedAt] ? 'dd.mm.yyyy HH:mm:ss' : 'dd.mm.yyyy');
@@ -3611,6 +3498,7 @@ function buildSettlementPayoutByMonth_() {
   const hm = buildHeaderMapCaseInsensitive_(headers);
 
   const colMonth = hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] + 1 || 0;
+  const colPosted = hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] + 1 || 0;
   const colDeposit = hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] + 1 || 0;
   const colTransfer = hm[normalizeHeaderKey_(CONFIG.HEADERS.transfer)] + 1 || 0;
   const colFileId = hm[normalizeHeaderKey_(CONFIG.HEADERS.fileId)] + 1 || 0;
@@ -3623,7 +3511,7 @@ function buildSettlementPayoutByMonth_() {
     const fid = String(colFileId ? r[colFileId - 1] : '').trim();
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
 
-    const month = monthFromSummaryRow_(r, colMonth, colDeposit);
+    const month = monthFromSummaryRow_(r, colMonth, colPosted, colDeposit);
     if (!month) continue;
 
     const transfer = parseNumberFlexible_(r[colTransfer - 1]);
@@ -3634,10 +3522,14 @@ function buildSettlementPayoutByMonth_() {
   return out;
 }
 
-function monthFromSummaryRow_(row, colMonth, colDeposit) {
+function monthFromSummaryRow_(row, colMonth, colPosted, colDeposit) {
   const monthVal = colMonth ? row[colMonth - 1] : '';
   const monthText = toMonthText_(monthVal);
   if (monthText) return monthText;
+
+  const postedVal = colPosted ? row[colPosted - 1] : '';
+  const postedMonth = toMonthText_(postedVal);
+  if (postedMonth) return postedMonth;
 
   const depVal = colDeposit ? row[colDeposit - 1] : '';
   return toMonthText_(depVal);
@@ -4243,7 +4135,7 @@ function buildSettlementFeesByMonth_() {
     const r = all[i];
     const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
-    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
+    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
     if (!month) continue;
     if (!out[month]) out[month] = { fees: 0 };
     out[month].fees += parseNumberFlexible_(r[feeCol]);
@@ -4299,7 +4191,7 @@ function buildSettlementCogsByMonth_() {
     const r = all[i];
     const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
-    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
+    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
     if (!month) continue;
 
     if (!out[month]) out[month] = { cogs: 0 };
@@ -4404,7 +4296,7 @@ function buildSettlementFilesRegistry_() {
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
     out[fid] = {
       fileName: String(valueByHeader_(r, hm, CONFIG.HEADERS.fileName) || ''),
-      month: monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1),
+      month: monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1),
       payout: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.transfer)),
       cogs: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.cogs)),
       fees: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.feesCost))
