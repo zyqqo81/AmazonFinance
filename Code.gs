@@ -688,6 +688,8 @@ function importSettlementTxtFile_(fileId, options) {
     'Імпортовано: ' + fileName,
     'Settlement ID: ' + parsed.settlementId,
     'Deposit Date: ' + Utilities.formatDate(parsed.depositDate, CONFIG.TZ, 'yyyy-MM-dd'),
+    'Effective Posted Date: ' + Utilities.formatDate(parsed.postedDate, CONFIG.TZ, 'yyyy-MM-dd') + ' (' + parsed.postedDateSource + ')',
+    'Assigned Month: ' + Utilities.formatDate(parsed.monthDate, CONFIG.TZ, 'yyyy-MM'),
     'Sales: ' + fromCents_(parsed.salesC).toFixed(2),
     'VAT: ' + fromCents_(parsed.vatC).toFixed(2),
     'Fees: ' + fromCents_(parsed.feesExpenseC).toFixed(2),
@@ -819,7 +821,6 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
   }
 
   const settlementId = cellByHeader_(firstRow, idx, 'settlement-id');
-  const postedDateRaw = cellByHeader_(firstRow, idx, 'posted-date');
   const depositDateRaw = cellByHeader_(firstRow, idx, 'deposit-date');
   const transferC = detectTransferC_(dataRows, idx, warnings || []);
   let marketplaceName = cellByHeader_(firstRow, idx, 'marketplace-name');
@@ -832,8 +833,8 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     ]);
   }
 
-  const postedDateParsed = parseDateFlexible_(postedDateRaw, CONFIG.TZ, { referenceDate: dateReference });
-  const postedDate = (postedDateParsed instanceof Date && !isNaN(postedDateParsed.getTime())) ? postedDateParsed : depositDate;
+  const effectivePosted = resolveSettlementEffectiveDate_(dataRows, idx, depositDate, dateReference);
+  const postedDate = effectivePosted.date;
   const monthDate = new Date(Date.UTC(postedDate.getUTCFullYear(), postedDate.getUTCMonth(), 1));
 
   let salesC = 0;
@@ -954,6 +955,8 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     settlementId: settlementId,
     depositDate: depositDate,
     postedDate: postedDate,
+    postedDateSource: effectivePosted.source,
+    postedDateCandidates: effectivePosted.candidates,
     monthDate: monthDate,
     marketplaceName: marketplaceName,
     transferC: transferC,
@@ -974,6 +977,28 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     units: units,
     rowData: rowData
   };
+}
+
+function resolveSettlementEffectiveDate_(rows, idx, depositDate, referenceDate) {
+  const postedIdx = idx && idx['posted-date'] !== undefined ? idx['posted-date'] : -1;
+  let earliest = null;
+  let candidates = 0;
+
+  if (postedIdx >= 0) {
+    for (let i = 0; i < (rows || []).length; i++) {
+      const rawPosted = rows[i] && rows[i][postedIdx] !== undefined ? rows[i][postedIdx] : '';
+      const parsed = parseDateFlexible_(rawPosted, CONFIG.TZ, { referenceDate: referenceDate });
+      if (!(parsed instanceof Date) || isNaN(parsed.getTime())) continue;
+      candidates += 1;
+      if (!earliest || parsed.getTime() < earliest.getTime()) earliest = parsed;
+    }
+  }
+
+  if (earliest) {
+    return { date: earliest, source: 'posted-date rows (earliest)', candidates: candidates };
+  }
+
+  return { date: depositDate, source: 'deposit-date fallback', candidates: 0 };
 }
 
 /* =========================
@@ -4216,13 +4241,13 @@ function writeDiagnostics_() {
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
 
-  rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'File Name', 'Month', 'Payout', 'COGS', 'Fees', '']);
+  rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'File Name', 'Deposit Date', 'Effective Posted Date', 'Assigned Month', 'Payout', 'COGS | Fees']);
   const settlementFiles = buildSettlementFilesRegistry_();
   const settlementIds = Object.keys(settlementFiles).sort();
   for (let i = 0; i < settlementIds.length; i++) {
     const fid = settlementIds[i];
     const it = settlementFiles[fid];
-    rows.push(['DATA', 'A. Імпортовані settlement файли', fid, it.fileName, it.month, it.payout, it.cogs, it.fees, '']);
+    rows.push(['DATA', 'A. Імпортовані settlement файли', fid, it.fileName, it.depositDate, it.postedDate, it.month, it.payout, it.cogs + ' | ' + it.fees]);
   }
 
   rows.push(['INFO', 'B. Імпортовані sales файли', 'File ID', 'File Name', 'Rows Imported', 'First Month', 'Last Month', 'Imported At', '']);
@@ -4296,6 +4321,8 @@ function buildSettlementFilesRegistry_() {
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
     out[fid] = {
       fileName: String(valueByHeader_(r, hm, CONFIG.HEADERS.fileName) || ''),
+      depositDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.depositDate)),
+      postedDate: formatDateForDiagnostics_(valueByHeader_(r, hm, CONFIG.HEADERS.postedDate)),
       month: monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1),
       payout: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.transfer)),
       cogs: parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.cogs)),
@@ -4358,6 +4385,13 @@ function buildSalesTaxUniques_() {
   out.shipToCountries = Object.keys(countries).sort();
   out.taxCollectionResponsibility = Object.keys(responsibilities).sort();
   return out;
+}
+
+function formatDateForDiagnostics_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, CONFIG.TZ, 'yyyy-MM-dd');
+  const parsed = parseDateFlexible_(value, CONFIG.TZ);
+  if (parsed instanceof Date && !isNaN(parsed.getTime())) return Utilities.formatDate(parsed, CONFIG.TZ, 'yyyy-MM-dd');
+  return String(value || '').trim();
 }
 
 function arraysEqualByTrim_(a, b) {
