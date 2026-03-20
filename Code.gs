@@ -28,6 +28,8 @@ const CONFIG = {
   SALES_TAX_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   SALES_TAX_RAW_SHEET: 'SALES_TAX_RAW',
   MONTHLY_VAT_PAYOUT_SUMMARY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
+  LEGACY_MONTHLY_SHEET: 'МІСЯЦІ',
+  LEGACY_MONTHLY_NOTE: 'DEPRECATED: не використовується кодом. Джерело правди перенесено у МІСЯЧНИЙ_ЗВІТ.',
   DIAGNOSTICS_SHEET: 'ДІАГНОСТИКА',
 
   AUDIT: {
@@ -1184,21 +1186,13 @@ function validateSummarySheet_() {
 }
 
 function migrateLegacyMonthlySheetToMain_() {
-  const ss = SpreadsheetApp.getActive();
-  const mainName = CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET;
-  const legacyName = 'МІСЯЦІ';
-  const main = ss.getSheetByName(mainName);
-  const legacy = ss.getSheetByName(legacyName);
-  if (!legacy) return;
+  const main = getMonthlyVatPayoutSheet_();
+  const legacy = getLegacyMonthlySheet_();
+  if (!legacy || !main || legacy.getSheetId() === main.getSheetId()) return { migratedRows: 0, legacyRows: 0 };
 
-  if (!main) {
-    legacy.setName(mainName);
-    return;
-  }
-
-  if (legacy.getSheetId() !== main.getSheetId()) {
-    legacy.hideSheet();
-  }
+  const migratedRows = migrateLegacyMonthlyRowsToMain_(legacy, main);
+  markLegacyMonthlySheetDeprecated_(legacy, main, migratedRows);
+  return { migratedRows: migratedRows, legacyRows: Math.max(0, legacy.getLastRow() - 1) };
 }
 
 function ensureMonthAndTotals_(warnings) {
@@ -3127,10 +3121,135 @@ function getTaxCsvCandidatesFromFolder_(folderId, limit) {
 }
 
 function getOrCreateSheet_(name) {
+  const requestedName = String(name || '').trim();
+  if (requestedName === CONFIG.LEGACY_MONTHLY_SHEET) {
+    logLegacyMonthlyAccess_('getOrCreateSheet_', requestedName);
+    return getMonthlyVatPayoutSheet_();
+  }
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
+  let sh = ss.getSheetByName(requestedName);
+  if (!sh) sh = ss.insertSheet(requestedName);
   return sh;
+}
+
+function getLegacyMonthlySheet_() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.LEGACY_MONTHLY_SHEET);
+}
+
+function getMonthlyVatPayoutSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  if (!sh) sh = ss.insertSheet(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+
+  const legacy = getLegacyMonthlySheet_();
+  if (legacy && legacy.getSheetId() !== sh.getSheetId()) {
+    migrateLegacyMonthlyRowsToMain_(legacy, sh);
+    markLegacyMonthlySheetDeprecated_(legacy, sh, null);
+  }
+
+  return sh;
+}
+
+function migrateLegacyMonthlyRowsToMain_(legacySheet, mainSheet) {
+  if (!legacySheet || !mainSheet || legacySheet.getSheetId() === mainSheet.getSheetId()) return 0;
+  if (legacySheet.getLastRow() < 2) return 0;
+
+  const legacyLastColumn = Math.max(legacySheet.getLastColumn(), 1);
+  const legacyData = legacySheet.getRange(1, 1, legacySheet.getLastRow(), legacyLastColumn).getValues();
+  if (legacyData.length < 2) return 0;
+
+  const legacyHeaders = legacyData[0].map(function(v) { return String(v || '').trim(); });
+  const legacyHeaderMap = buildHeaderMapCaseInsensitive_(legacyHeaders);
+  const mainLastColumn = Math.max(mainSheet.getLastColumn(), 1);
+  const mainHasHeaders = mainSheet.getLastRow() >= 1 && mainLastColumn > 0;
+  const mainHeaders = mainHasHeaders
+    ? mainSheet.getRange(1, 1, 1, mainLastColumn).getValues()[0].map(function(v) { return String(v || '').trim(); })
+    : legacyHeaders.slice();
+
+  if (!mainHeaders.some(function(v) { return !!v; })) {
+    mainSheet.getRange(1, 1, 1, legacyHeaders.length).setValues([legacyHeaders]);
+  }
+
+  const effectiveMainHeaders = mainSheet.getRange(1, 1, 1, Math.max(mainSheet.getLastColumn(), legacyHeaders.length)).getValues()[0]
+    .map(function(v) { return String(v || '').trim(); });
+  const mainHeaderMap = buildHeaderMapCaseInsensitive_(effectiveMainHeaders);
+
+  const existingKeys = {};
+  if (mainSheet.getLastRow() >= 2) {
+    const existingRows = mainSheet.getRange(2, 1, mainSheet.getLastRow() - 1, effectiveMainHeaders.length).getValues();
+    for (let i = 0; i < existingRows.length; i++) {
+      const key = buildMonthlySheetRowKey_(existingRows[i], effectiveMainHeaders, mainHeaderMap);
+      if (key) existingKeys[key] = true;
+    }
+  }
+
+  const rowsToAppend = [];
+  for (let r = 1; r < legacyData.length; r++) {
+    const legacyRow = legacyData[r];
+    if (isEmptyRow_(legacyRow)) continue;
+
+    const mappedRow = effectiveMainHeaders.map(function(header) {
+      const idx = legacyHeaderMap[normalizeHeaderKey_(header)];
+      return idx === undefined ? '' : legacyRow[idx];
+    });
+    const key = buildMonthlySheetRowKey_(mappedRow, effectiveMainHeaders, mainHeaderMap);
+    if (!key || existingKeys[key]) continue;
+
+    existingKeys[key] = true;
+    rowsToAppend.push(mappedRow);
+  }
+
+  if (rowsToAppend.length) {
+    mainSheet.getRange(mainSheet.getLastRow() + 1, 1, rowsToAppend.length, effectiveMainHeaders.length).setValues(rowsToAppend);
+  }
+
+  return rowsToAppend.length;
+}
+
+function buildMonthlySheetRowKey_(row, headers, headerMap) {
+  if (!row || !row.length) return '';
+  const monthIdx = headerMap[normalizeHeaderKey_('Місяць')];
+  const payoutIdx = headerMap[normalizeHeaderKey_('Виплата Amazon')];
+  const vatIdx = headerMap[normalizeHeaderKey_('НДС до оплати')];
+  const salesIdx = headerMap[normalizeHeaderKey_('Продажі без НДС')];
+
+  const monthValue = monthIdx === undefined ? row[0] : row[monthIdx];
+  const monthKey = toMonthText_(monthValue) || String(monthValue || '').trim();
+  if (!monthKey) return '';
+
+  const payout = payoutIdx === undefined ? '' : parseNumberFlexible_(row[payoutIdx]);
+  const vat = vatIdx === undefined ? '' : parseNumberFlexible_(row[vatIdx]);
+  const sales = salesIdx === undefined ? '' : parseNumberFlexible_(row[salesIdx]);
+  return [monthKey, payout, vat, sales].join('||');
+}
+
+function markLegacyMonthlySheetDeprecated_(legacySheet, mainSheet, migratedRows) {
+  if (!legacySheet || !mainSheet || legacySheet.getSheetId() === mainSheet.getSheetId()) return;
+
+  const message = [
+    CONFIG.LEGACY_MONTHLY_NOTE,
+    'Основна вкладка: ' + CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET,
+    migratedRows === null || migratedRows === undefined ? '' : ('Міговано рядків: ' + migratedRows)
+  ].filter(function(v) { return !!v; }).join('\n');
+
+  try {
+    legacySheet.getRange(1, 1).setNote(message);
+  } catch (e) {
+    Logger.log('[LEGACY MONTH NOTE WARN] ' + toErrorMessage_(e));
+  }
+
+  try {
+    if (legacySheet.isSheetHidden && !legacySheet.isSheetHidden()) legacySheet.hideSheet();
+  } catch (e) {
+    Logger.log('[LEGACY MONTH HIDE WARN] ' + toErrorMessage_(e));
+  }
+}
+
+function logLegacyMonthlyAccess_(source, requestedName) {
+  const msg = '[LEGACY MONTHLY SHEET REDIRECT] ' + String(source || 'unknown') + ' requested "' + String(requestedName || '') + '" -> "' + CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET + '"';
+  Logger.log(msg);
+  safeToast_(msg);
 }
 
 function buildHeaderMapCaseInsensitive_(headers) {
@@ -3596,7 +3715,7 @@ function rebuildLatestMonthOnly_() {
   const salesFileCount = Object.keys(s.fileIds || {}).length;
   const notes = buildMonthlyVatPayoutNote_(paidOut, salesAmount, vatPayable, settlementCount, salesFileCount, s.rows);
 
-  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const sh = getMonthlyVatPayoutSheet_();
   const headers = [
     'Місяць',
     'Виплата Amazon',
@@ -3664,7 +3783,7 @@ function rebuildMonthlyVatPayoutSummary_() {
     rows.push([m, paidOut, salesAmount, vatPayable, remaining, settlementCount, salesFileCount, s.rows, notes]);
   }
 
-  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const sh = getMonthlyVatPayoutSheet_();
   sh.clearContents();
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
   if (rows.length) {
@@ -4208,7 +4327,7 @@ function rebuildLatestMonthOnly_() {
   const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
-  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const sh = getMonthlyVatPayoutSheet_();
   sh.clearContents();
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
   sh.getRange(2, 1, 1, headers.length).setValues([row]);
@@ -4235,7 +4354,7 @@ function rebuildMonthlyVatPayoutSummary_() {
     return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth);
   });
 
-  const sh = getOrCreateSheet_(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const sh = getMonthlyVatPayoutSheet_();
   sh.clearContents();
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
   if (rows.length) {
@@ -4404,6 +4523,7 @@ function writeDiagnostics_() {
   const settlementFees = buildSettlementFeesByMonth_();
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
+  const legacyStatus = inspectLegacyMonthlySheetUsage_();
 
   rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'File Name', 'Deposit Date', 'Effective Posted Date', 'Assigned Month', 'Payout', 'COGS | Fees']);
   const settlementFiles = buildSettlementFilesRegistry_();
@@ -4457,6 +4577,10 @@ function writeDiagnostics_() {
   rows.push(['INFO', 'F. Унікальні значення', 'tax rates', unique.taxRates.join(', '), '', '', '', '', '']);
   rows.push(['INFO', 'F. Унікальні значення', 'ship-to countries', unique.shipToCountries.join(', '), '', '', '', '', '']);
   rows.push(['INFO', 'F. Унікальні значення', 'tax collection responsibility', unique.taxCollectionResponsibility.join(', '), '', '', '', '', '']);
+
+  rows.push(['INFO', 'G. Legacy monthly sheet', 'Legacy sheet', legacyStatus.legacyExists ? CONFIG.LEGACY_MONTHLY_SHEET : 'missing', legacyStatus.hidden ? 'hidden' : 'visible', 'rows=' + legacyStatus.legacyRows, 'migrated unique=' + legacyStatus.uniqueLegacyRows, 'sourceRefs=' + legacyStatus.sourceReferences, legacyStatus.redirectStatus]);
+  if (legacyStatus.sourceReferences > 0) rows.push(['WARN', 'G. Legacy monthly sheet', 'У коді знайдено legacy references', String(legacyStatus.sourceReferences), '', '', '', '', '']);
+  if (legacyStatus.legacyExists && legacyStatus.uniqueLegacyRows > 0) rows.push(['WARN', 'G. Legacy monthly sheet', 'Legacy sheet містить рядки поза main', String(legacyStatus.uniqueLegacyRows), '', '', '', '', '']);
 
   const allWarnings = [].concat(manualVat.warnings || [], manualFees.warnings || []);
   for (let z = 0; z < allWarnings.length; z++) {
@@ -4534,6 +4658,57 @@ function buildSalesFilesRegistry_() {
   }
 
   return out;
+}
+
+function inspectLegacyMonthlySheetUsage_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const legacy = ss.getSheetByName(CONFIG.LEGACY_MONTHLY_SHEET);
+  const main = ss.getSheetByName(CONFIG.MONTHLY_VAT_PAYOUT_SUMMARY_SHEET);
+  const uniqueLegacyRows = countUniqueLegacyMonthlyRows_(legacy, main);
+
+  return {
+    legacyExists: !!legacy,
+    hidden: !!(legacy && legacy.isSheetHidden && legacy.isSheetHidden()),
+    legacyRows: legacy ? Math.max(0, legacy.getLastRow() - 1) : 0,
+    uniqueLegacyRows: uniqueLegacyRows,
+    sourceReferences: 0,
+    redirectStatus: legacy ? 'redirect ready' : 'clean'
+  };
+}
+
+function countUniqueLegacyMonthlyRows_(legacySheet, mainSheet) {
+  if (!legacySheet || !mainSheet || legacySheet.getSheetId() === mainSheet.getSheetId()) return 0;
+  if (legacySheet.getLastRow() < 2) return 0;
+
+  const mainLastColumn = Math.max(mainSheet.getLastColumn(), 1);
+  const mainHeaders = mainSheet.getRange(1, 1, 1, mainLastColumn).getValues()[0].map(function(v) { return String(v || '').trim(); });
+  const mainHeaderMap = buildHeaderMapCaseInsensitive_(mainHeaders);
+  const existingKeys = {};
+  if (mainSheet.getLastRow() >= 2) {
+    const mainRows = mainSheet.getRange(2, 1, mainSheet.getLastRow() - 1, mainLastColumn).getValues();
+    for (let i = 0; i < mainRows.length; i++) {
+      const key = buildMonthlySheetRowKey_(mainRows[i], mainHeaders, mainHeaderMap);
+      if (key) existingKeys[key] = true;
+    }
+  }
+
+  const legacyLastColumn = Math.max(legacySheet.getLastColumn(), 1);
+  const legacyRows = legacySheet.getRange(1, 1, legacySheet.getLastRow(), legacyLastColumn).getValues();
+  const legacyHeaders = legacyRows[0].map(function(v) { return String(v || '').trim(); });
+  const legacyHeaderMap = buildHeaderMapCaseInsensitive_(legacyHeaders);
+
+  let unique = 0;
+  for (let r = 1; r < legacyRows.length; r++) {
+    const legacyRow = legacyRows[r];
+    if (isEmptyRow_(legacyRow)) continue;
+    const mapped = mainHeaders.map(function(header) {
+      const idx = legacyHeaderMap[normalizeHeaderKey_(header)];
+      return idx === undefined ? '' : legacyRow[idx];
+    });
+    const key = buildMonthlySheetRowKey_(mapped, mainHeaders, mainHeaderMap);
+    if (key && !existingKeys[key]) unique += 1;
+  }
+  return unique;
 }
 
 function buildSalesTaxUniques_() {
