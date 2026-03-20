@@ -7,6 +7,7 @@ const CONFIG = {
   SUMMARY_SHEET: 'ІМПОРТ – ЗВЕДЕННЯ',
   MONTHLY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
   PURCHASES_SHEET: 'Закупки',
+  MANUAL_EXPENSES_SHEET: 'РУЧНІ_ВИТРАТИ',
   MANUAL_OPERATIONS_SHEET: 'РУЧНІ_ОПЕРАЦІЇ',
   LEGACY_BUSINESS_EXPENSES_SHEET: 'ВИТРАТИ_БІЗНЕСУ',
   TZ: 'Europe/Rome',
@@ -115,7 +116,7 @@ const CONFIG = {
  * MENU
  * ========================= */
 
-function onOpen() {
+function onOpenLegacyMenu_() {
   SpreadsheetApp.getUi()
     .createMenu('Фінанси Amazon')
     .addItem('Завантажити всі settlement файли', 'uiImportAllFromFolder_')
@@ -3915,18 +3916,18 @@ function mergeMonthKeys_(a, b) {
 
 function buildMonthlyVatPayoutNote_(paidOut, salesAmount, vatPayable, settlementCount, salesFileCount, salesRowsCount) {
   const notes = [];
-  if (settlementCount === 0) notes.push('No settlement payout data');
-  if (salesFileCount === 0) notes.push('No sales/tax data');
-  if (salesRowsCount > 0 && salesAmount === 0 && vatPayable === 0) notes.push('Sales rows present but totals are zero');
+  if (settlementCount === 0) notes.push('Немає даних по виплатах settlement');
+  if (salesFileCount === 0) notes.push('Немає даних зі звітів продажів');
+  if (salesRowsCount > 0 && salesAmount === 0 && vatPayable === 0) notes.push('Є рядки продажів, але підсумки дорівнюють нулю');
   return notes.join('; ');
 }
 
-function runVatDiagnostics_() {
-  const diagnosticsRows = writeDiagnostics_();
+function runVatDiagnosticsLegacy_() {
+  const diagnosticsRows = writeDiagnosticsLegacy_();
   return { rows: diagnosticsRows.length };
 }
 
-function writeDiagnostics_() {
+function writeDiagnosticsLegacy_() {
   const diagnosticsRows = [];
   const salesSheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SALES_TAX_RAW_SHEET);
   if (!salesSheet || salesSheet.getLastRow() < 2) {
@@ -4100,10 +4101,11 @@ function isEmptyRow_(row) {
 }
 
 /* =========================
- * UI/REPORT EXTENSION: MANUAL AMAZON FEES + VAT (NON-BREAKING LAYER)
+ * UI/REPORT EXTENSION: РУЧНІ ВИТРАТИ + МІСЯЧНИЙ ЗВІТ (БЕЗ ЗМІНИ COGS)
  * ========================= */
 
 function onOpen() {
+  ensureUkrainianLabels_();
   const menu = getLocalizedMenuConfig_();
   const uiMenu = SpreadsheetApp.getUi().createMenu(menu.title);
   for (let i = 0; i < menu.items.length; i++) {
@@ -4112,6 +4114,15 @@ function onOpen() {
     else uiMenu.addItem(item.label, item.functionName);
   }
   uiMenu.addToUi();
+}
+
+function ensureUkrainianLabels_() {
+  return {
+    menuTitle: 'Фінанси Amazon',
+    manualExpensesSheet: getManualExpensesSheetName_(),
+    monthlySheet: CONFIG.MONTHLY_SHEET,
+    diagnosticsSheet: CONFIG.DIAGNOSTICS_SHEET
+  };
 }
 
 function getLocalizedMenuConfig_() {
@@ -4123,8 +4134,7 @@ function getLocalizedMenuConfig_() {
       { label: 'Імпортувати всі звіти продажів', functionName: 'menuImportAllSalesTaxReports_' },
       { label: 'Імпортувати останній звіт продажів', functionName: 'menuImportLatestSalesTaxReport_' },
       { separator: true },
-      { label: 'Ініціалізувати ручні операції', functionName: 'menuEnsureManualOperationsSheet_' },
-      { label: 'Синхронізувати закупки', functionName: 'menuSyncManualPurchases_' },
+      { label: 'Ініціалізувати лист ручних витрат', functionName: 'menuEnsureManualExpensesSheet_' },
       { label: 'Оновити лист введення НДС', functionName: 'menuEnsureManualVatSheet_' },
       { label: 'Оновити лист введення комісій', functionName: 'menuEnsureManualFeesSheet_' },
       { separator: true },
@@ -4164,19 +4174,23 @@ function menuImportAllSalesTaxReports_() {
   }
 }
 
-function menuEnsureManualOperationsSheet_() {
+function menuEnsureManualExpensesSheet_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    const res = ensureManualOperationsSheet_();
+    const res = ensureManualExpensesSheet_();
     ui.alert([
-      'Лист ручних операцій готовий.',
+      'Лист ручних витрат готовий.',
       'Лист: ' + res.sheetName,
       'Створено: ' + (res.created ? 'так' : 'ні'),
       'Додано заголовків: ' + res.addedHeaders
     ].join('\n'));
   } catch (e) {
-    ui.alert('Помилка підготовки листа ручних операцій: ' + toErrorMessage_(e));
+    ui.alert('Помилка підготовки листа ручних витрат: ' + toErrorMessage_(e));
   }
+}
+
+function menuEnsureManualOperationsSheet_() {
+  return menuEnsureManualExpensesSheet_();
 }
 
 function menuSyncManualPurchases_() {
@@ -4184,15 +4198,15 @@ function menuSyncManualPurchases_() {
   try {
     const res = syncManualPurchasesToZakupky_();
     ui.alert([
-      'Синхронізацію закупок завершено.',
+      'Синхронізацію в "Закупки" вимкнено для безпечної міграції.',
       'Опрацьовано рядків: ' + res.processed,
       'Створено: ' + res.inserted,
       'Оновлено: ' + res.updated,
       'Пропущено: ' + res.skipped,
-      'Помилок: ' + res.errors.length
+      'Коментар: ' + res.message
     ].join('\n'));
   } catch (e) {
-    ui.alert('Помилка синхронізації закупок: ' + toErrorMessage_(e));
+    ui.alert('Помилка безпечної перевірки синхронізації: ' + toErrorMessage_(e));
   }
 }
 
@@ -4219,8 +4233,7 @@ function menuEnsureManualFeesSheet_() {
 function menuRebuildMonthlyReport_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualOperationsSheet_();
-    syncManualPurchasesToZakupky_();
+    ensureManualExpensesSheet_();
     const res = rebuildMonthlyVatPayoutSummary_();
     ui.alert(['Місячний звіт перераховано.', 'Місяців: ' + res.months, 'Сума виплат Amazon: ' + res.totalPayout.toFixed(2)].join('\n'));
   } catch (e) {
@@ -4231,8 +4244,7 @@ function menuRebuildMonthlyReport_() {
 function menuRebuildLatestMonthOnly_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualOperationsSheet_();
-    syncManualPurchasesToZakupky_();
+    ensureManualExpensesSheet_();
     const res = rebuildLatestMonthOnly_();
     ui.alert(['Останній місяць перераховано.', 'Місяць: ' + res.month, 'Виплата: ' + res.paidOut.toFixed(2), 'НДС до оплати: ' + res.vatToPay.toFixed(2)].join('\n'));
   } catch (e) {
@@ -4243,7 +4255,7 @@ function menuRebuildLatestMonthOnly_() {
 function menuRunDiagnostics_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualOperationsSheet_();
+    ensureManualExpensesSheet_();
     const res = runVatDiagnostics_();
     ui.alert('Діагностику оновлено. Рядків: ' + res.rows);
   } catch (e) {
@@ -4251,10 +4263,33 @@ function menuRunDiagnostics_() {
   }
 }
 
-function getManualOperationsHeaders_() {
+function getManualExpensesSheetName_() {
+  return CONFIG.MANUAL_EXPENSES_SHEET || 'РУЧНІ_ВИТРАТИ';
+}
+
+function getManualExpenseTypes_() {
+  return [
+    'Бізнес-витрата',
+    'Закуп у постачальника',
+    'Пакування',
+    'Сервіси та підписки',
+    'Логістика',
+    'Інше'
+  ];
+}
+
+function getManualExpensePaymentMethods_() {
+  return ['Картка', 'Банк', 'Готівка', 'PayPal', 'Інше'];
+}
+
+function getManualExpenseDocumentTypes_() {
+  return ['Рахунок', 'Фактура', 'Чек', 'Без документа'];
+}
+
+function getManualExpensesHeaders_() {
   return [
     'ID',
-    'Тип операції',
+    'Тип витрати',
     'Дата',
     'Місяць',
     'Категорія',
@@ -4262,27 +4297,28 @@ function getManualOperationsHeaders_() {
     'Постачальник',
     'Тип документа',
     'Номер документа',
-    'SKU',
-    'ASIN',
-    'Кількість',
-    'Ціна за одиницю без НДС',
     'Сума без НДС',
     'Сума НДС',
     'Сума з НДС',
     'Валюта',
     'Спосіб оплати',
-    'Примітки',
-    'Активно'
+    'Враховувати у прибутку',
+    'Активно',
+    'Примітки'
   ];
 }
 
-function ensureManualOperationsSheet_() {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(CONFIG.MANUAL_OPERATIONS_SHEET);
-  const created = !sh;
-  if (!sh) sh = ss.insertSheet(CONFIG.MANUAL_OPERATIONS_SHEET);
+function getManualOperationsHeaders_() {
+  return getManualExpensesHeaders_();
+}
 
-  const headers = getManualOperationsHeaders_();
+function ensureManualExpensesSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(getManualExpensesSheetName_());
+  const created = !sh;
+  if (!sh) sh = ss.insertSheet(getManualExpensesSheetName_());
+
+  const headers = getManualExpensesHeaders_();
   let addedHeaders = 0;
   const maxCols = Math.max(sh.getLastColumn() || 1, headers.length);
   const row1 = sh.getRange(1, 1, 1, maxCols).getValues()[0].map(function(v) { return String(v || '').trim(); });
@@ -4303,23 +4339,40 @@ function ensureManualOperationsSheet_() {
 
   const hm = getHeaderMap_(sh);
   const dataRows = Math.max(1, sh.getMaxRows() - 1);
-  if (hm['Тип операції']) {
+  if (hm['Тип витрати']) {
     const typeRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList([CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE, CONFIG.MANUAL_OPERATION_TYPES.PURCHASE], true)
+      .requireValueInList(getManualExpenseTypes_(), true)
       .setAllowInvalid(true)
       .build();
-    sh.getRange(2, hm['Тип операції'], dataRows, 1).setDataValidation(typeRule);
+    sh.getRange(2, hm['Тип витрати'], dataRows, 1).setDataValidation(typeRule);
   }
-  if (hm['Активно']) {
-    sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
+  if (hm['Тип документа']) {
+    const docRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(getManualExpenseDocumentTypes_(), true)
+      .setAllowInvalid(true)
+      .build();
+    sh.getRange(2, hm['Тип документа'], dataRows, 1).setDataValidation(docRule);
   }
-  if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'manualOperations.date');
-  if (hm['Місяць']) safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'manualOperations.month');
-  ['Кількість', 'Ціна за одиницю без НДС', 'Сума без НДС', 'Сума НДС', 'Сума з НДС'].forEach(function(header) {
-    if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '#,##0.00', [], 'manualOperations.' + header);
+  if (hm['Спосіб оплати']) {
+    const paymentRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(getManualExpensePaymentMethods_(), true)
+      .setAllowInvalid(true)
+      .build();
+    sh.getRange(2, hm['Спосіб оплати'], dataRows, 1).setDataValidation(paymentRule);
+  }
+  if (hm['Враховувати у прибутку']) sh.getRange(2, hm['Враховувати у прибутку'], dataRows, 1).insertCheckboxes();
+  if (hm['Активно']) sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
+  if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'manualExpenses.date');
+  if (hm['Місяць']) safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'manualExpenses.month');
+  ['Сума без НДС', 'Сума НДС', 'Сума з НДС'].forEach(function(header) {
+    if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '#,##0.00', [], 'manualExpenses.' + header);
   });
 
-  return { sheetName: CONFIG.MANUAL_OPERATIONS_SHEET, created: created, addedHeaders: addedHeaders };
+  return { sheetName: getManualExpensesSheetName_(), created: created, addedHeaders: addedHeaders };
+}
+
+function ensureManualOperationsSheet_() {
+  return ensureManualExpensesSheet_();
 }
 
 function rowArrayToObject_(row, headers) {
@@ -4328,21 +4381,42 @@ function rowArrayToObject_(row, headers) {
   return out;
 }
 
-function normalizeManualOperationType_(value) {
+function normalizeManualExpenseType_(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (!raw) return '';
-  if (raw === CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE.toLowerCase()) return CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE;
-  if (raw === CONFIG.MANUAL_OPERATION_TYPES.PURCHASE.toLowerCase()) return CONFIG.MANUAL_OPERATION_TYPES.PURCHASE;
-  if (raw.indexOf('витрат') !== -1) return CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE;
-  if (raw.indexOf('закуп') !== -1 || raw.indexOf('purchase') !== -1) return CONFIG.MANUAL_OPERATION_TYPES.PURCHASE;
+
+  const known = getManualExpenseTypes_();
+  for (let i = 0; i < known.length; i++) {
+    if (raw === known[i].toLowerCase()) return known[i];
+  }
+  if (raw.indexOf('закуп') !== -1 || raw.indexOf('постачаль') !== -1 || raw.indexOf('supplier') !== -1) return 'Закуп у постачальника';
+  if (raw.indexOf('пакув') !== -1) return 'Пакування';
+  if (raw.indexOf('сервіс') !== -1 || raw.indexOf('підпис') !== -1 || raw.indexOf('subscription') !== -1) return 'Сервіси та підписки';
+  if (raw.indexOf('логіст') !== -1 || raw.indexOf('достав') !== -1 || raw.indexOf('transport') !== -1) return 'Логістика';
+  if (raw.indexOf('бізнес') !== -1 || raw.indexOf('витрат') !== -1 || raw.indexOf('expense') !== -1) return 'Бізнес-витрата';
+  if (raw.indexOf('інше') !== -1 || raw.indexOf('other') !== -1) return 'Інше';
   return String(value || '').trim();
 }
 
-function isManualOperationActive_(value) {
-  if (value === false) return false;
+function normalizeManualOperationType_(value) {
+  return normalizeManualExpenseType_(value);
+}
+
+function manualExpenseBoolean_(value, defaultValue) {
+  if (value === true || value === false) return value;
   const raw = String(value === null || value === undefined ? '' : value).trim().toLowerCase();
-  if (!raw) return true;
-  return ['false', '0', 'ні', 'no'].indexOf(raw) === -1;
+  if (!raw) return defaultValue;
+  if (['true', '1', 'так', 'yes', 'y'].indexOf(raw) !== -1) return true;
+  if (['false', '0', 'ні', 'no', 'n'].indexOf(raw) !== -1) return false;
+  return defaultValue;
+}
+
+function isManualOperationActive_(value) {
+  return manualExpenseBoolean_(value, true);
+}
+
+function isManualExpenseIncludedInProfit_(value) {
+  return manualExpenseBoolean_(value, false);
 }
 
 function roundMoney_(value) {
@@ -4350,8 +4424,16 @@ function roundMoney_(value) {
   return Math.round(num * 100) / 100;
 }
 
-function normalizeManualOperationRow_(row, headerMap, rowNumber) {
-  const headers = getManualOperationsHeaders_();
+function deriveManualExpenseMonthKey_(value) {
+  const parsedDate = parseDateFlexible_(value, CONFIG.TZ, {});
+  if (parsedDate instanceof Date && !isNaN(parsedDate.getTime())) {
+    return Utilities.formatDate(parsedDate, CONFIG.TZ, 'yyyy-MM');
+  }
+  return toMonthText_(value);
+}
+
+function normalizeManualExpenseRow_(row, headerMap, rowNumber) {
+  const headers = getManualExpensesHeaders_();
   const out = headers.map(function(header) {
     const col = headerMap[header];
     return col ? row[col - 1] : '';
@@ -4362,84 +4444,90 @@ function normalizeManualOperationRow_(row, headerMap, rowNumber) {
   function get(header) { return out[idx(header)]; }
   function set(header, value) { out[idx(header)] = value; }
 
-  if (!String(get('ID') || '').trim()) set('ID', 'MO-' + Utilities.getUuid());
+  if (!String(get('ID') || '').trim()) set('ID', 'RV-' + Utilities.getUuid());
 
-  const parsedDate = parseDateFlexible_(get('Дата'), CONFIG.TZ, {});
+  const originalDate = get('Дата');
+  const parsedDate = parseDateFlexible_(originalDate, CONFIG.TZ, {});
   if (parsedDate instanceof Date && !isNaN(parsedDate.getTime())) {
     set('Дата', parsedDate);
     set('Місяць', Utilities.formatDate(parsedDate, CONFIG.TZ, 'yyyy-MM'));
-  } else if (String(get('Дата') || '').trim() !== '') {
-    warnings.push('Рядок ' + rowNumber + ': невалідна дата.');
+  } else {
+    const monthKey = deriveManualExpenseMonthKey_(get('Місяць'));
+    if (monthKey) set('Місяць', monthKey);
+    if (String(originalDate || '').trim() !== '') warnings.push('Рядок ' + rowNumber + ': невалідна дата.');
   }
 
   if (!String(get('Валюта') || '').trim()) set('Валюта', CONFIG.CURRENCY || 'EUR');
   if (get('Активно') === '' || get('Активно') === null) set('Активно', true);
-  set('Тип операції', normalizeManualOperationType_(get('Тип операції')));
+  set('Тип витрати', normalizeManualExpenseType_(get('Тип витрати')));
 
-  const qty = parseNumberFlexible_(get('Кількість'));
-  const unitPrice = parseNumberFlexible_(get('Ціна за одиницю без НДС'));
   const netAmount = parseNumberFlexible_(get('Сума без НДС'));
   const vatAmount = parseNumberFlexible_(get('Сума НДС'));
   const grossAmount = parseNumberFlexible_(get('Сума з НДС'));
+  if (!grossAmount && (netAmount || vatAmount)) set('Сума з НДС', roundMoney_(netAmount + vatAmount));
 
-  if (!netAmount && qty > 0 && unitPrice > 0) set('Сума без НДС', roundMoney_(qty * unitPrice));
-  if (!grossAmount && (parseNumberFlexible_(get('Сума без НДС')) > 0 || vatAmount > 0)) {
-    set('Сума з НДС', roundMoney_(parseNumberFlexible_(get('Сума без НДС')) + vatAmount));
-  }
-
-  const opType = String(get('Тип операції') || '').trim();
-  const effectiveAmount = parseNumberFlexible_(get('Сума без НДС')) || parseNumberFlexible_(get('Сума з НДС'));
-  if (!opType) warnings.push('Рядок ' + rowNumber + ': не вказано тип операції.');
-  if (!effectiveAmount) warnings.push('Рядок ' + rowNumber + ': не вказано суму.');
-  if (opType === CONFIG.MANUAL_OPERATION_TYPES.PURCHASE && !normalizeSku_(get('SKU')) && !String(get('Опис') || '').trim()) {
-    warnings.push('Рядок ' + rowNumber + ': закупка товару без SKU і без опису.');
-  }
+  const effectiveAmount = netAmount || parseNumberFlexible_(get('Сума з НДС'));
+  if (!String(get('Тип витрати') || '').trim()) warnings.push('Рядок ' + rowNumber + ': не вказано тип витрати.');
+  if (!effectiveAmount) warnings.push('Рядок ' + rowNumber + ': не вказано суму без НДС або суму з НДС.');
 
   return { row: out, warnings: warnings };
 }
 
-function getManualOperationsData_() {
-  ensureManualOperationsSheet_();
-  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.MANUAL_OPERATIONS_SHEET);
-  const headers = getManualOperationsHeaders_();
+function normalizeManualOperationRow_(row, headerMap, rowNumber) {
+  return normalizeManualExpenseRow_(row, headerMap, rowNumber);
+}
+
+function getManualExpensesData_() {
+  ensureManualExpensesSheet_();
+  const sh = SpreadsheetApp.getActive().getSheetByName(getManualExpensesSheetName_());
+  const headers = getManualExpensesHeaders_();
   const hm = getHeaderMap_(sh);
   if (!sh || sh.getLastRow() < 2) return { sheet: sh, headerMap: hm, rows: [] };
 
-  const all = sh.getRange(2, 1, sh.getLastRow() - 1, Math.max(sh.getLastColumn(), headers.length)).getValues();
+  const width = Math.max(sh.getLastColumn(), headers.length);
+  const all = sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues();
   const normalizedRows = [];
   const objects = [];
   for (let i = 0; i < all.length; i++) {
-    const normalized = normalizeManualOperationRow_(all[i], hm, i + 2);
+    const normalized = normalizeManualExpenseRow_(all[i], hm, i + 2);
     const obj = rowArrayToObject_(normalized.row, headers);
     obj.__rowNumber = i + 2;
     obj.__warnings = normalized.warnings;
     obj.__active = isManualOperationActive_(obj['Активно']);
-    obj.__month = String(obj['Місяць'] || '').trim();
+    obj.__includeInProfit = isManualExpenseIncludedInProfit_(obj['Враховувати у прибутку']);
+    obj.__month = deriveManualExpenseMonthKey_(obj['Місяць']) || deriveManualExpenseMonthKey_(obj['Дата']) || '';
     obj.__netAmount = parseNumberFlexible_(obj['Сума без НДС']);
     obj.__vatAmount = parseNumberFlexible_(obj['Сума НДС']);
     obj.__grossAmount = parseNumberFlexible_(obj['Сума з НДС']);
     obj.__effectiveAmount = obj.__netAmount || obj.__grossAmount || 0;
-    obj.__quantity = parseNumberFlexible_(obj['Кількість']);
-    obj.__unitPrice = parseNumberFlexible_(obj['Ціна за одиницю без НДС']);
     normalizedRows.push(normalized.row);
     objects.push(obj);
   }
 
-  sh.getRange(2, 1, normalizedRows.length, headers.length).setValues(normalizedRows);
+  if (normalizedRows.length) {
+    sh.getRange(2, 1, normalizedRows.length, headers.length).setValues(normalizedRows);
+  }
   return { sheet: sh, headerMap: hm, rows: objects };
 }
 
-function validateManualOperationRows_() {
-  const data = getManualOperationsData_();
+function getManualOperationsData_() {
+  return getManualExpensesData_();
+}
+
+function validateManualExpenseRows_() {
+  const data = getManualExpensesData_();
   const stats = {
     totalRows: data.rows.length,
-    activeBusinessExpenses: 0,
-    activePurchases: 0,
+    activeRows: 0,
+    includedInProfitRows: 0,
     inactiveRows: 0,
     invalidDateRows: [],
     missingAmountRows: [],
     missingTypeRows: [],
-    purchaseMissingSkuRows: [],
+    supplierPurchaseRows: 0,
+    businessExpenseRows: 0,
+    totalsByMonth: {},
+    vatTotalsByMonth: {},
     warnings: []
   };
 
@@ -4449,31 +4537,96 @@ function validateManualOperationRows_() {
       stats.inactiveRows += 1;
       continue;
     }
+
+    stats.activeRows += 1;
     if (!row.__month) stats.invalidDateRows.push(row.__rowNumber);
-    if (!row['Тип операції']) stats.missingTypeRows.push(row.__rowNumber);
+    if (!row['Тип витрати']) stats.missingTypeRows.push(row.__rowNumber);
     if (!row.__effectiveAmount) stats.missingAmountRows.push(row.__rowNumber);
-    if (row['Тип операції'] === CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE) stats.activeBusinessExpenses += 1;
-    if (row['Тип операції'] === CONFIG.MANUAL_OPERATION_TYPES.PURCHASE) {
-      stats.activePurchases += 1;
-      if (!normalizeSku_(row['SKU']) && !String(row['Опис'] || '').trim()) stats.purchaseMissingSkuRows.push(row.__rowNumber);
+    if (row['Тип витрати'] === 'Закуп у постачальника') stats.supplierPurchaseRows += 1;
+    if (row['Тип витрати'] === 'Бізнес-витрата') stats.businessExpenseRows += 1;
+
+    if (row.__includeInProfit && row.__month && row.__effectiveAmount) {
+      stats.includedInProfitRows += 1;
+      stats.totalsByMonth[row.__month] = roundMoney_((stats.totalsByMonth[row.__month] || 0) + row.__effectiveAmount);
+      stats.vatTotalsByMonth[row.__month] = roundMoney_((stats.vatTotalsByMonth[row.__month] || 0) + row.__vatAmount);
     }
+
     if (row.__warnings && row.__warnings.length) stats.warnings = stats.warnings.concat(row.__warnings);
   }
 
   return stats;
 }
 
-function collectManualOperationsByMonth_() {
-  const data = getManualOperationsData_();
+function validateManualOperationRows_() {
+  return validateManualExpenseRows_();
+}
+
+function collectManualExpensesByMonth_() {
+  const data = getManualExpensesData_();
   const out = {};
+  const warnings = [];
+
   for (let i = 0; i < data.rows.length; i++) {
     const row = data.rows[i];
-    if (!row.__active || !row.__month) continue;
-    if (!out[row.__month]) out[row.__month] = { businessExpenses: [], purchases: [] };
-    if (row['Тип операції'] === CONFIG.MANUAL_OPERATION_TYPES.BUSINESS_EXPENSE) out[row.__month].businessExpenses.push(row);
-    if (row['Тип операції'] === CONFIG.MANUAL_OPERATION_TYPES.PURCHASE) out[row.__month].purchases.push(row);
+    if (!row.__active) continue;
+    if (!row.__month) {
+      warnings.push('Рядок ' + row.__rowNumber + ' пропущено: невалідна дата або місяць.');
+      continue;
+    }
+    if (!row.__effectiveAmount) {
+      warnings.push('Рядок ' + row.__rowNumber + ' пропущено: не вказано суму без НДС або суму з НДС.');
+      continue;
+    }
+    if (!out[row.__month]) {
+      out[row.__month] = {
+        amount: 0,
+        vat: 0,
+        rows: 0,
+        includedRows: 0,
+        allActiveRows: 0,
+        types: {}
+      };
+    }
+
+    out[row.__month].allActiveRows += 1;
+    const typeKey = String(row['Тип витрати'] || 'Без типу');
+    out[row.__month].types[typeKey] = (out[row.__month].types[typeKey] || 0) + 1;
+
+    if (!row.__includeInProfit) continue;
+
+    out[row.__month].amount = roundMoney_(out[row.__month].amount + row.__effectiveAmount);
+    out[row.__month].vat = roundMoney_(out[row.__month].vat + row.__vatAmount);
+    out[row.__month].rows += 1;
+    out[row.__month].includedRows += 1;
   }
-  return out;
+
+  const legacy = readLegacyBusinessExpensesByMonth_();
+  const legacyMonths = Object.keys(legacy.byMonth || {});
+  for (let j = 0; j < legacyMonths.length; j++) {
+    const legacyMonth = legacyMonths[j];
+    if (!out[legacyMonth]) {
+      out[legacyMonth] = {
+        amount: 0,
+        vat: 0,
+        rows: 0,
+        includedRows: 0,
+        allActiveRows: 0,
+        types: {}
+      };
+    }
+    out[legacyMonth].amount = roundMoney_(out[legacyMonth].amount + legacy.byMonth[legacyMonth].amount);
+    out[legacyMonth].vat = roundMoney_(out[legacyMonth].vat + legacy.byMonth[legacyMonth].vat);
+    out[legacyMonth].rows += legacy.byMonth[legacyMonth].rows;
+    out[legacyMonth].includedRows += legacy.byMonth[legacyMonth].rows;
+    out[legacyMonth].allActiveRows += legacy.byMonth[legacyMonth].rows;
+    out[legacyMonth].types['Застарілий лист витрат'] = (out[legacyMonth].types['Застарілий лист витрат'] || 0) + legacy.byMonth[legacyMonth].rows;
+  }
+
+  return { byMonth: out, warnings: warnings.concat(legacy.warnings || []) };
+}
+
+function collectManualOperationsByMonth_() {
+  return collectManualExpensesByMonth_();
 }
 
 function readLegacyBusinessExpensesByMonth_() {
@@ -4492,132 +4645,60 @@ function readLegacyBusinessExpensesByMonth_() {
     out[month].vat += parseNumberFlexible_(valueByHeader_(row, hm, 'Сума НДС')) || parseNumberFlexible_(valueByHeader_(row, hm, 'НДС')) || 0;
     out[month].rows += 1;
   }
-  return { byMonth: out, warnings: ['Використано застарілий лист "' + CONFIG.LEGACY_BUSINESS_EXPENSES_SHEET + '" як резервне джерело.'] };
+  return { byMonth: out, warnings: ['Використано застарілий лист "' + CONFIG.LEGACY_BUSINESS_EXPENSES_SHEET + '" як резервне джерело ручних витрат.'] };
 }
 
 function collectBusinessExpensesByMonth_() {
-  const grouped = collectManualOperationsByMonth_();
-  const out = {};
-  const months = Object.keys(grouped);
-  for (let i = 0; i < months.length; i++) {
-    const month = months[i];
-    const rows = grouped[month].businessExpenses || [];
-    if (!out[month]) out[month] = { amount: 0, vat: 0, rows: 0 };
-    for (let j = 0; j < rows.length; j++) {
-      out[month].amount += rows[j].__effectiveAmount;
-      out[month].vat += rows[j].__vatAmount;
-      out[month].rows += 1;
-    }
-    out[month].amount = roundMoney_(out[month].amount);
-    out[month].vat = roundMoney_(out[month].vat);
-  }
-
-  const legacy = readLegacyBusinessExpensesByMonth_();
-  const legacyMonths = Object.keys(legacy.byMonth || {});
-  for (let k = 0; k < legacyMonths.length; k++) {
-    const legacyMonth = legacyMonths[k];
-    if (!out[legacyMonth]) out[legacyMonth] = { amount: 0, vat: 0, rows: 0 };
-    out[legacyMonth].amount = roundMoney_(out[legacyMonth].amount + legacy.byMonth[legacyMonth].amount);
-    out[legacyMonth].vat = roundMoney_(out[legacyMonth].vat + legacy.byMonth[legacyMonth].vat);
-    out[legacyMonth].rows += legacy.byMonth[legacyMonth].rows;
-  }
-
-  return { byMonth: out, warnings: legacy.warnings || [] };
+  return collectManualExpensesByMonth_();
 }
 
 function collectPurchaseRowsForSync_() {
-  const data = getManualOperationsData_();
-  const warnings = [];
+  const data = getManualExpensesData_();
   const rows = [];
   for (let i = 0; i < data.rows.length; i++) {
     const row = data.rows[i];
-    if (!row.__active || row['Тип операції'] !== CONFIG.MANUAL_OPERATION_TYPES.PURCHASE) continue;
-    if (!row.__effectiveAmount) {
-      warnings.push('Рядок ' + row.__rowNumber + ' пропущено: не вказано суму закупки.');
-      continue;
-    }
-    if (!normalizeSku_(row['SKU']) && !String(row['Опис'] || '').trim()) {
-      warnings.push('Рядок ' + row.__rowNumber + ' пропущено: закупка товару без SKU і без опису.');
-      continue;
-    }
-    rows.push(row);
+    if (!row.__active) continue;
+    if (row['Тип витрати'] === 'Закуп у постачальника') rows.push(row);
   }
-  return { rows: rows, warnings: warnings };
+  return {
+    rows: rows,
+    warnings: rows.length ? ['Синхронізацію з листом "Закупки" вимкнено: агреговані закупи не можна використовувати як SKU-level COGS.'] : []
+  };
 }
 
 function ensurePurchasesSyncHeaders_(sh) {
-  const required = [CONFIG.PURCHASES.sourceHeader, CONFIG.PURCHASES.sourceIdHeader, CONFIG.PURCHASES.syncUpdatedAtHeader];
-  const row1 = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), 1)).getValues()[0].map(function(v) { return String(v || '').trim(); });
-  let appendAt = sh.getLastColumn();
-  for (let i = 0; i < required.length; i++) {
-    if (row1.indexOf(required[i]) === -1) {
-      appendAt += 1;
-      sh.getRange(1, appendAt).setValue(required[i]);
-    }
-  }
   return getHeaderMap_(sh);
 }
 
 function syncManualPurchasesToZakupky_() {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(CONFIG.PURCHASES_SHEET);
-  if (!sh) sh = ss.insertSheet(CONFIG.PURCHASES_SHEET);
-  if (sh.getLastRow() === 0) sh.getRange(1, 1, 1, 2).setValues([[CONFIG.PURCHASES.skuHeader, CONFIG.PURCHASES.unitCostHeader]]);
+  const preview = collectPurchaseRowsForSync_();
+  return {
+    processed: preview.rows.length,
+    inserted: 0,
+    updated: 0,
+    skipped: preview.rows.length,
+    errors: [],
+    message: 'Лист "РУЧНІ_ВИТРАТИ" не синхронізується з "Закупки". Існуюча COGS логіка залишена без змін.'
+  };
+}
 
-  let hm = getHeaderMap_(sh);
-  if (!hm[CONFIG.PURCHASES.skuHeader]) sh.getRange(1, sh.getLastColumn() + 1).setValue(CONFIG.PURCHASES.skuHeader);
-  hm = getHeaderMap_(sh);
-  if (!hm[CONFIG.PURCHASES.unitCostHeader]) sh.getRange(1, sh.getLastColumn() + 1).setValue(CONFIG.PURCHASES.unitCostHeader);
-  hm = ensurePurchasesSyncHeaders_(sh);
+function applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth) {
+  const info = (manualExpensesByMonth && manualExpensesByMonth[month]) || { amount: 0, vat: 0 };
+  const profitBeforeVat = parseNumberFlexible_(row[7]);
+  const paidVat = parseNumberFlexible_(row[11]);
+  const profitAfterManualExpenses = roundMoney_(profitBeforeVat - info.amount);
+  const vatToPay = roundMoney_(row[3] - paidVat);
 
-  const all = sh.getLastRow() >= 2 ? sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues() : [];
-  const sourceIdCol = hm[CONFIG.PURCHASES.sourceIdHeader];
-  const sourceCol = hm[CONFIG.PURCHASES.sourceHeader];
-  const updatedCol = hm[CONFIG.PURCHASES.syncUpdatedAtHeader];
-  const existingBySourceId = {};
-  for (let i = 0; i < all.length; i++) {
-    const sourceId = String(all[i][sourceIdCol - 1] || '').trim();
-    if (sourceId) existingBySourceId[sourceId] = i + 2;
-  }
-
-  const payload = collectPurchaseRowsForSync_();
-  const result = { processed: payload.rows.length, inserted: 0, updated: 0, skipped: payload.warnings.length, errors: [] };
-  const now = new Date();
-
-  for (let j = 0; j < payload.rows.length; j++) {
-    const row = payload.rows[j];
-    try {
-      const targetRow = existingBySourceId[row['ID']] || (sh.getLastRow() + 1);
-      const lastColumn = sh.getLastColumn();
-      const output = sh.getRange(targetRow, 1, 1, lastColumn).getValues()[0];
-      output[hm[CONFIG.PURCHASES.skuHeader] - 1] = normalizeSku_(row['SKU']) || String(row['Опис'] || '').trim();
-      output[hm[CONFIG.PURCHASES.unitCostHeader] - 1] = row.__unitPrice || (row.__quantity > 0 ? roundMoney_(row.__effectiveAmount / row.__quantity) : row.__effectiveAmount);
-      output[sourceCol - 1] = CONFIG.MANUAL_OPERATIONS_SHEET;
-      output[sourceIdCol - 1] = row['ID'];
-      output[updatedCol - 1] = now;
-      sh.getRange(targetRow, 1, 1, lastColumn).setValues([output]);
-      if (existingBySourceId[row['ID']]) result.updated += 1;
-      else {
-        existingBySourceId[row['ID']] = targetRow;
-        result.inserted += 1;
-      }
-    } catch (e) {
-      result.errors.push('Рядок ' + row.__rowNumber + ': ' + toErrorMessage_(e));
-    }
-  }
-
-  return result;
+  row[8] = roundMoney_(info.amount);
+  row[9] = roundMoney_(info.vat);
+  row[10] = profitAfterManualExpenses;
+  row[12] = vatToPay;
+  row[13] = roundMoney_(profitAfterManualExpenses - vatToPay);
+  return row;
 }
 
 function applyBusinessExpensesToMonthlyReport_(row, month, businessExpensesByMonth) {
-  const info = (businessExpensesByMonth && businessExpensesByMonth[month]) || { amount: 0, vat: 0 };
-  const profitBeforeVat = parseNumberFlexible_(row[9]);
-  const vatToPay = parseNumberFlexible_(row[11]);
-  row[6] = roundMoney_(info.amount);
-  row[7] = roundMoney_(info.vat);
-  row[12] = roundMoney_(profitBeforeVat - info.amount);
-  row[13] = roundMoney_(row[12] - vatToPay);
-  return row;
+  return applyManualExpensesToMonthlyReport_(row, month, businessExpensesByMonth);
 }
 
 function importLatestSalesTaxFileFromFolder_() {
@@ -4741,8 +4822,7 @@ function readManualFeesByMonth_() {
 }
 
 function rebuildLatestMonthOnly_() {
-  ensureManualOperationsSheet_();
-  syncManualPurchasesToZakupky_();
+  ensureManualExpensesSheet_();
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFees = buildSettlementFeesByMonth_();
@@ -4750,16 +4830,16 @@ function rebuildLatestMonthOnly_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const businessExpenses = collectBusinessExpensesByMonth_();
+  const manualExpenses = collectManualExpensesByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(businessExpenses.byMonth))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))
   );
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, businessExpenses.byMonth);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getMonthlyVatPayoutSheet_();
@@ -4768,12 +4848,11 @@ function rebuildLatestMonthOnly_() {
   sh.getRange(2, 1, 1, headers.length).setValues([row]);
   applyMonthlyVatPayoutFormats_(sh, 1);
 
-  return { month: month, paidOut: row[1], vatToPay: row[11], salesFileCount: row[15], settlementCount: row[14] };
+  return { month: month, paidOut: row[1], vatToPay: row[12], salesFileCount: row[15], settlementCount: row[14] };
 }
 
 function rebuildMonthlyVatPayoutSummary_() {
-  ensureManualOperationsSheet_();
-  syncManualPurchasesToZakupky_();
+  ensureManualExpensesSheet_();
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFees = buildSettlementFeesByMonth_();
@@ -4781,16 +4860,16 @@ function rebuildMonthlyVatPayoutSummary_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const businessExpenses = collectBusinessExpensesByMonth_();
+  const manualExpenses = collectManualExpensesByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(businessExpenses.byMonth))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))
   );
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, businessExpenses.byMonth);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth);
   });
 
   const sh = getMonthlyVatPayoutSheet_();
@@ -4814,13 +4893,13 @@ function monthlyVatPayoutHeaders_() {
     'НДС з продажів',
     'Продажі з НДС',
     'Комісії Amazon',
-    'Бізнес-витрати',
-    'НДС у бізнес-витратах',
     'Собівартість',
     'Прибуток до НДС',
+    'Ручні витрати',
+    'НДС у ручних витратах',
+    'Прибуток після ручних витрат',
     'Вже сплачений НДС',
     'НДС до оплати',
-    'Прибуток після бізнес-витрат',
     'Залишок після НДС',
     'К-сть settlement файлів',
     'К-сть sales файлів',
@@ -4828,7 +4907,7 @@ function monthlyVatPayoutHeaders_() {
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, businessExpensesByMonth) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpensesByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
   const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
@@ -4838,12 +4917,11 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, 
   const fees = hasManualFees ? manualFeesByMonth[month].fees : settlementFees;
 
   const profitBeforeVat = roundMoney_(p.paidOut - cogs);
-  const vatToPay = roundMoney_(s.vatPayable - paidVat);
-
   const settlementCount = Object.keys(p.fileIds || {}).length;
   const salesFileCount = Object.keys(s.fileIds || {}).length;
   const notes = (hasManualFees ? 'Комісії: ручне перевизначення. ' : 'Комісії: із settlement. ') +
-    buildMonthlyVatPayoutNote_(p.paidOut, s.salesAmount, vatToPay, settlementCount, salesFileCount, s.rows);
+    'Ручні витрати не впливають на COGS. ' +
+    buildMonthlyVatPayoutNote_(p.paidOut, s.salesAmount, roundMoney_(s.vatPayable - paidVat), settlementCount, salesFileCount, s.rows);
 
   const row = [
     month,
@@ -4852,20 +4930,20 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, 
     s.vatPayable,
     s.grossSales,
     fees,
-    0,
-    0,
     cogs,
     profitBeforeVat,
-    paidVat,
-    vatToPay,
+    0,
+    0,
     profitBeforeVat,
-    roundMoney_(profitBeforeVat - vatToPay),
+    paidVat,
+    roundMoney_(s.vatPayable - paidVat),
+    roundMoney_(profitBeforeVat - roundMoney_(s.vatPayable - paidVat)),
     settlementCount,
     salesFileCount,
     notes
   ];
 
-  return applyBusinessExpensesToMonthlyReport_(row, month, businessExpensesByMonth || {});
+  return applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth || {});
 }
 
 function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
@@ -4969,8 +5047,8 @@ function writeDiagnostics_() {
   const settlementFees = buildSettlementFeesByMonth_();
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const businessExpenses = collectBusinessExpensesByMonth_();
-  const manualValidation = validateManualOperationRows_();
+  const manualExpenses = collectManualExpensesByMonth_();
+  const manualValidation = validateManualExpenseRows_();
   const purchasePreview = collectPurchaseRowsForSync_();
   const purchaseSync = syncManualPurchasesToZakupky_();
   const legacyStatus = inspectLegacyMonthlySheetUsage_();
@@ -4993,8 +5071,8 @@ function writeDiagnostics_() {
     rows.push(['DATA', 'B. Імпортовані звіти продажів', sfid, sit.fileName, sit.rows, sit.firstMonth, sit.lastMonth, Object.keys(sit.importedAtSet).sort().join(' | '), '']);
   }
 
-  rows.push(['INFO', 'C. Підсумок по місяцях', 'Місяць', 'Виплата', 'COGS', 'Комісії settlement', 'НДС з продажів', 'Сплачений НДС', 'Бізнес-витрати']);
-  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(manualVat.byMonth), Object.keys(businessExpenses.byMonth))));
+  rows.push(['INFO', 'C. Підсумок по місяцях', 'Місяць', 'Виплата', 'COGS', 'Комісії settlement', 'НДС з продажів', 'Сплачений НДС', 'Ручні витрати']);
+  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))));
   for (let k = 0; k < months.length; k++) {
     const m = months[k];
     rows.push(['DATA', 'C. Підсумок по місяцях', m,
@@ -5003,43 +5081,50 @@ function writeDiagnostics_() {
       (settlementFees[m] || { fees: 0 }).fees,
       (salesAgg[m] || { vatPayable: 0 }).vatPayable,
       (manualVat.byMonth[m] || { paidVat: 0 }).paidVat,
-      (businessExpenses.byMonth[m] || { amount: 0 }).amount
+      (manualExpenses.byMonth[m] || { amount: 0 }).amount
     ]);
   }
 
-  rows.push(['INFO', 'D. Ручні операції', 'Усього рядків', manualValidation.totalRows, 'Активні бізнес-витрати', manualValidation.activeBusinessExpenses, 'Активні закупки', manualValidation.activePurchases, 'Неактивні: ' + manualValidation.inactiveRows]);
-  rows.push(['INFO', 'D. Ручні операції', 'Невалідні дати', manualValidation.invalidDateRows.join(', '), 'Рядки без суми', manualValidation.missingAmountRows.join(', '), 'Рядки без типу', manualValidation.missingTypeRows.join(', '), 'Закупки без SKU: ' + manualValidation.purchaseMissingSkuRows.join(', ')]);
-  rows.push(['INFO', 'D. Ручні операції', 'Кандидати на синхронізацію', purchasePreview.rows.length, 'Пропущено', purchasePreview.warnings.length, 'Створено в Закупки', purchaseSync.inserted, 'Оновлено в Закупки: ' + purchaseSync.updated]);
+  rows.push(['INFO', 'D. Ручні витрати', 'Усього рядків', manualValidation.totalRows, 'Активні рядки', manualValidation.activeRows, 'У прибутку', manualValidation.includedInProfitRows, 'Неактивні: ' + manualValidation.inactiveRows]);
+  rows.push(['INFO', 'D. Ручні витрати', 'Невалідні дати', manualValidation.invalidDateRows.join(', '), 'Рядки без суми', manualValidation.missingAmountRows.join(', '), 'Рядки без типу', manualValidation.missingTypeRows.join(', '), 'Закуп у постачальника: ' + manualValidation.supplierPurchaseRows]);
+  rows.push(['INFO', 'D. Ручні витрати', 'Бізнес-витрата', manualValidation.businessExpenseRows, 'Попередній перегляд рядків типу закуп у постачальника', purchasePreview.rows.length, 'Синхронізація в Закупки', 'вимкнено: ' + purchaseSync.skipped]);
 
-  rows.push(['INFO', 'E. Ручний НДС по місяцях', 'Місяць', 'Сплачений НДС', 'Рядків', 'Попередження', '', '', '']);
-  const vatMonths = Object.keys(manualVat.byMonth).sort();
-  for (let x = 0; x < vatMonths.length; x++) {
-    const vm = vatMonths[x];
-    const v = manualVat.byMonth[vm];
-    rows.push(['DATA', 'E. Ручний НДС по місяцях', vm, v.paidVat, v.rows, '', '', '', '']);
+  const manualExpenseMonths = Object.keys(manualValidation.totalsByMonth).sort();
+  rows.push(['INFO', 'E. Ручні витрати по місяцях', 'Місяць', 'Сума для прибутку', 'НДС', 'Коментар', '', '', '']);
+  for (let x = 0; x < manualExpenseMonths.length; x++) {
+    const monthKey = manualExpenseMonths[x];
+    rows.push(['DATA', 'E. Ручні витрати по місяцях', monthKey, manualValidation.totalsByMonth[monthKey], manualValidation.vatTotalsByMonth[monthKey] || 0, 'Активні та з прапорцем "Враховувати у прибутку"', '', '', '']);
   }
 
-  rows.push(['INFO', 'F. Ручні комісії по місяцях', 'Місяць', 'Комісії', 'Рядків', 'Попередження', '', '', '']);
+  rows.push(['INFO', 'F. Ручний НДС по місяцях', 'Місяць', 'Сплачений НДС', 'Рядків', 'Попередження', '', '', '']);
+  const vatMonths = Object.keys(manualVat.byMonth).sort();
+  for (let y = 0; y < vatMonths.length; y++) {
+    const vm = vatMonths[y];
+    const v = manualVat.byMonth[vm];
+    rows.push(['DATA', 'F. Ручний НДС по місяцях', vm, v.paidVat, v.rows, '', '', '', '']);
+  }
+
+  rows.push(['INFO', 'G. Ручні комісії по місяцях', 'Місяць', 'Комісії', 'Рядків', 'Попередження', '', '', '']);
   const feeMonths = Object.keys(manualFees.byMonth).sort();
-  for (let y = 0; y < feeMonths.length; y++) {
-    const fm = feeMonths[y];
+  for (let z = 0; z < feeMonths.length; z++) {
+    const fm = feeMonths[z];
     const f = manualFees.byMonth[fm];
-    rows.push(['DATA', 'F. Ручні комісії по місяцях', fm, f.fees, f.rows, '', '', '', '']);
+    rows.push(['DATA', 'G. Ручні комісії по місяцях', fm, f.fees, f.rows, '', '', '', '']);
   }
 
   const unique = buildSalesTaxUniques_();
-  rows.push(['INFO', 'G. Унікальні значення', 'Ставки податку', unique.taxRates.join(', '), '', '', '', '', '']);
-  rows.push(['INFO', 'G. Унікальні значення', 'Країни доставки', unique.shipToCountries.join(', '), '', '', '', '', '']);
-  rows.push(['INFO', 'G. Унікальні значення', 'Відповідальний за збір податку', unique.taxCollectionResponsibility.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'H. Унікальні значення', 'Ставки податку', unique.taxRates.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'H. Унікальні значення', 'Країни доставки', unique.shipToCountries.join(', '), '', '', '', '', '']);
+  rows.push(['INFO', 'H. Унікальні значення', 'Відповідальний за збір податку', unique.taxCollectionResponsibility.join(', '), '', '', '', '', '']);
 
-  rows.push(['INFO', 'H. Legacy monthly sheet', 'Legacy sheet', legacyStatus.legacyExists ? CONFIG.LEGACY_MONTHLY_SHEET : 'відсутній', legacyStatus.hidden ? 'прихований' : 'видимий', 'rows=' + legacyStatus.legacyRows, 'migrated unique=' + legacyStatus.uniqueLegacyRows, 'sourceRefs=' + legacyStatus.sourceReferences, legacyStatus.redirectStatus]);
-  if (legacyStatus.sourceReferences > 0) rows.push(['WARN', 'H. Legacy monthly sheet', 'У коді знайдено legacy references', String(legacyStatus.sourceReferences), '', '', '', '', '']);
-  if (legacyStatus.legacyExists && legacyStatus.uniqueLegacyRows > 0) rows.push(['WARN', 'H. Legacy monthly sheet', 'Legacy sheet містить рядки поза main', String(legacyStatus.uniqueLegacyRows), '', '', '', '', '']);
+  rows.push(['INFO', 'I. Legacy monthly sheet', 'Legacy sheet', legacyStatus.legacyExists ? CONFIG.LEGACY_MONTHLY_SHEET : 'відсутній', legacyStatus.hidden ? 'прихований' : 'видимий', 'rows=' + legacyStatus.legacyRows, 'migrated unique=' + legacyStatus.uniqueLegacyRows, 'sourceRefs=' + legacyStatus.sourceReferences, legacyStatus.redirectStatus]);
+  if (legacyStatus.sourceReferences > 0) rows.push(['WARN', 'I. Legacy monthly sheet', 'У коді знайдено legacy references', String(legacyStatus.sourceReferences), '', '', '', '', '']);
+  if (legacyStatus.legacyExists && legacyStatus.uniqueLegacyRows > 0) rows.push(['WARN', 'I. Legacy monthly sheet', 'Legacy sheet містить рядки поза main', String(legacyStatus.uniqueLegacyRows), '', '', '', '', '']);
 
   const allWarnings = []
-    .concat(manualVat.warnings || [], manualFees.warnings || [], businessExpenses.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || []);
-  for (let z = 0; z < allWarnings.length; z++) {
-    rows.push(['WARN', 'I. Попередження', allWarnings[z], '', '', '', '', '', '']);
+    .concat(manualVat.warnings || [], manualFees.warnings || [], manualExpenses.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || []);
+  for (let q = 0; q < allWarnings.length; q++) {
+    rows.push(['WARN', 'J. Попередження', allWarnings[q], '', '', '', '', '', '']);
   }
 
   const sh = getOrCreateSheet_(CONFIG.DIAGNOSTICS_SHEET);
