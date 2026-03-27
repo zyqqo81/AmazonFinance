@@ -6,6 +6,7 @@
 const CONFIG = {
   SUMMARY_SHEET: 'ІМПОРТ – ЗВЕДЕННЯ',
   MONTHLY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
+  DASHBOARD_SHEET: 'ДЕШБОРД',
   PURCHASES_SHEET: 'Закупки',
   MANUAL_EXPENSES_SHEET: 'РУЧНІ_ВИТРАТИ',
   MANUAL_OPERATIONS_SHEET: 'РУЧНІ_ОПЕРАЦІЇ',
@@ -4140,7 +4141,9 @@ function getLocalizedMenuConfig_() {
       { separator: true },
       { label: 'Перерахувати весь місячний звіт', functionName: 'menuRebuildMonthlyReport_' },
       { label: 'Перерахувати останній місяць', functionName: 'menuRebuildLatestMonthOnly_' },
-      { label: 'Діагностика', functionName: 'menuRunDiagnostics_' }
+      { label: 'Діагностика', functionName: 'menuRunDiagnostics_' },
+      { separator: true },
+      { label: 'Оновити дешборд', functionName: 'menuRebuildDashboard_' }
     ]
   };
 }
@@ -4249,6 +4252,20 @@ function menuRebuildLatestMonthOnly_() {
     ui.alert(['Останній місяць перераховано.', 'Місяць: ' + res.month, 'Виплата: ' + res.paidOut.toFixed(2), 'НДС до оплати: ' + res.vatToPay.toFixed(2)].join('\n'));
   } catch (e) {
     ui.alert('Помилка перерахунку останнього місяця: ' + toErrorMessage_(e));
+  }
+}
+
+function menuRebuildDashboard_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = rebuildDashboard_();
+    if (res.empty) {
+      ui.alert('Дешборд оновлено. Даних у ' + CONFIG.MONTHLY_SHEET + ' поки немає.');
+      return;
+    }
+    ui.alert(['Дешборд оновлено.', 'Місяців: ' + res.months, 'Останній місяць: ' + res.latestMonth].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка оновлення дешборду: ' + toErrorMessage_(e));
   }
 }
 
@@ -5381,4 +5398,220 @@ function arraysEqualByTrim_(a, b) {
     if (String(a[i] || '').trim() !== String(b[i] || '').trim()) return false;
   }
   return true;
+}
+
+function rebuildDashboard_() {
+  const ss = SpreadsheetApp.getActive();
+  const source = ss.getSheetByName(CONFIG.MONTHLY_SHEET);
+  if (!source) throw new Error('Не знайдено лист: ' + CONFIG.MONTHLY_SHEET);
+
+  const dashboard = ensureDashboardSheet_();
+  clearDashboardSheet_(dashboard);
+
+  const monthlyRows = readMonthlyDashboardRows_(source);
+  if (!monthlyRows.length) {
+    renderEmptyDashboard_(dashboard);
+    return { empty: true, months: 0, latestMonth: '' };
+  }
+
+  monthlyRows.sort(function(a, b) {
+    if (a.month < b.month) return -1;
+    if (a.month > b.month) return 1;
+    return 0;
+  });
+
+  renderDashboardBlocks_(dashboard, monthlyRows);
+  renderDashboardCharts_(dashboard, monthlyRows);
+  dashboard.autoResizeColumns(1, 8);
+  dashboard.setFrozenRows(2);
+
+  return { empty: false, months: monthlyRows.length, latestMonth: monthlyRows[monthlyRows.length - 1].month };
+}
+
+function ensureDashboardSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(CONFIG.DASHBOARD_SHEET);
+  if (!sh) sh = ss.insertSheet(CONFIG.DASHBOARD_SHEET);
+  return sh;
+}
+
+function clearDashboardSheet_(sheet) {
+  if (!sheet) return;
+  sheet.clear();
+  const charts = sheet.getCharts();
+  for (let i = 0; i < charts.length; i++) sheet.removeChart(charts[i]);
+}
+
+function readMonthlyDashboardRows_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return [];
+  const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(values[0]);
+
+  const idxMonth = hm[normalizeHeaderKey_('Місяць')];
+  const idxProfitBeforeVat = hm[normalizeHeaderKey_('Прибуток до НДС')];
+  const idxVatToPay = hm[normalizeHeaderKey_('НДС до оплати')];
+  const idxVatPaidTotal = hm[normalizeHeaderKey_('Вже сплачений НДС (разом)')];
+  const idxCashAfterVat = hm[normalizeHeaderKey_('Залишок після НДС')];
+
+  const missing = [];
+  if (idxMonth === undefined) missing.push('Місяць');
+  if (idxProfitBeforeVat === undefined) missing.push('Прибуток до НДС');
+  if (idxVatToPay === undefined) missing.push('НДС до оплати');
+  if (idxVatPaidTotal === undefined) missing.push('Вже сплачений НДС (разом)');
+  if (idxCashAfterVat === undefined) missing.push('Залишок після НДС');
+  if (missing.length) throw new Error('У ' + CONFIG.MONTHLY_SHEET + ' відсутні колонки: ' + missing.join(', '));
+
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const month = toMonthText_(row[idxMonth]);
+    if (!month) continue;
+
+    const rawProfitBeforeVat = row[idxProfitBeforeVat];
+    const rawVatToPay = row[idxVatToPay];
+    const rawVatPaid = row[idxVatPaidTotal];
+    const rawCashAfterVat = row[idxCashAfterVat];
+    const profitBeforeVat = parseNumberFlexible_(rawProfitBeforeVat);
+    const vatToPay = parseNumberFlexible_(rawVatToPay);
+    const vatPaid = parseNumberFlexible_(rawVatPaid);
+    const cashAfterVat = parseNumberFlexible_(rawCashAfterVat);
+    const invalidNumber = (
+      !isDashboardNumberLike_(rawProfitBeforeVat) ||
+      !isDashboardNumberLike_(rawVatToPay) ||
+      !isDashboardNumberLike_(rawVatPaid) ||
+      !isDashboardNumberLike_(rawCashAfterVat)
+    );
+    if (invalidNumber) continue;
+
+    out.push({
+      month: month,
+      profitBeforeVat: roundMoney_(profitBeforeVat),
+      vatToPay: roundMoney_(vatToPay),
+      vatPaid: roundMoney_(vatPaid),
+      cashAfterVat: roundMoney_(cashAfterVat)
+    });
+  }
+
+  const byMonth = {};
+  for (let j = 0; j < out.length; j++) byMonth[out[j].month] = out[j];
+  return Object.keys(byMonth).map(function(key) { return byMonth[key]; });
+}
+
+function isDashboardNumberLike_(value) {
+  if (value === null || value === undefined || value === '') return true;
+  if (typeof value === 'number') return isFinite(value);
+  const parsed = parseNumberFlexible_(value);
+  const text = String(value).replace(/\s/g, '').replace(',', '.').trim();
+  if (!text) return true;
+  const simple = text.replace(/^[+-]/, '');
+  if (!/^\d*(\.\d+)?$/.test(simple)) return false;
+  return isFinite(parsed);
+}
+
+function renderEmptyDashboard_(sheet) {
+  sheet.getRange('A1').setValue('ДЕШБОРД AMAZON FBA').setFontWeight('bold').setFontSize(18);
+  sheet.getRange('A3').setValue('Немає даних у листі ' + CONFIG.MONTHLY_SHEET + '. Спочатку сформуйте місячний звіт.');
+  sheet.getRange('A3').setFontColor('#b71c1c').setFontWeight('bold');
+  sheet.autoResizeColumns(1, 4);
+}
+
+function renderDashboardBlocks_(sheet, rows) {
+  const totals = rows.reduce(function(acc, row) {
+    acc.profitBeforeVat += row.profitBeforeVat;
+    acc.vatToPay += row.vatToPay;
+    acc.vatPaid += row.vatPaid;
+    acc.cashAfterVat += row.cashAfterVat;
+    return acc;
+  }, { profitBeforeVat: 0, vatToPay: 0, vatPaid: 0, cashAfterVat: 0 });
+
+  const totalProfitAfterVat = roundMoney_(totals.cashAfterVat);
+  const avgProfitPerMonth = rows.length ? roundMoney_(totals.cashAfterVat / rows.length) : 0;
+  const latest = rows[rows.length - 1];
+
+  sheet.getRange('A1').setValue('ДЕШБОРД AMAZON FBA').setFontWeight('bold').setFontSize(18);
+  sheet.getRange('A2').setValue('Оновлено: ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss'));
+
+  const kpiHeaders = [
+    'Загальний прибуток (після НДС)',
+    'Загальний прибуток до НДС',
+    'Загальний НДС до оплати',
+    'Вже сплачений НДС (разом)',
+    'Залишок після НДС (cash)',
+    'Середній прибуток за місяць'
+  ];
+  const kpiValues = [
+    totalProfitAfterVat,
+    roundMoney_(totals.profitBeforeVat),
+    roundMoney_(totals.vatToPay),
+    roundMoney_(totals.vatPaid),
+    roundMoney_(totals.cashAfterVat),
+    avgProfitPerMonth
+  ];
+
+  for (let i = 0; i < kpiHeaders.length; i++) {
+    const col = i < 3 ? (1 + i * 2) : (1 + (i - 3) * 2);
+    const row = i < 3 ? 4 : 7;
+    sheet.getRange(row, col, 1, 2).merge();
+    sheet.getRange(row, col).setValue(kpiHeaders[i]).setFontWeight('bold').setBackground('#e8f0fe');
+    sheet.getRange(row + 1, col, 1, 2).merge();
+    sheet.getRange(row + 1, col).setValue(kpiValues[i]).setFontSize(16).setFontWeight('bold').setNumberFormat('€#,##0.00');
+  }
+
+  sheet.getRange('A11').setValue('Поточний місяць: ' + latest.month).setFontWeight('bold').setFontSize(13);
+  sheet.getRange(12, 1, 1, 4).setValues([['Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#f3f3f3');
+  sheet.getRange(13, 1, 1, 4).setValues([[latest.profitBeforeVat, latest.vatToPay, latest.vatPaid, latest.cashAfterVat]]).setNumberFormat('€#,##0.00').setFontWeight('bold');
+
+  sheet.getRange('A15').setValue('Таблиця по місяцях').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(16, 1, 1, 5).setValues([['Місяць', 'Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС (разом)', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#d9ead3');
+  const tableRows = rows.map(function(row) {
+    return [row.month, row.profitBeforeVat, row.vatToPay, row.vatPaid, row.cashAfterVat];
+  });
+  sheet.getRange(17, 1, tableRows.length, 5).setValues(tableRows);
+  sheet.getRange(17, 1, tableRows.length, 1).setNumberFormat('@');
+  sheet.getRange(17, 2, tableRows.length, 4).setNumberFormat('€#,##0.00');
+
+  const splitHeaderRow = 17 + tableRows.length + 2;
+  sheet.getRange(splitHeaderRow, 1).setValue('Фінансовий розподіл від загального прибутку після НДС').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(splitHeaderRow + 1, 1, 1, 2).setValues([['Категорія', 'Сума']]).setFontWeight('bold').setBackground('#fff2cc');
+  sheet.getRange(splitHeaderRow + 2, 1, 4, 2).setValues([
+    ['Реінвест (75%)', roundMoney_(totalProfitAfterVat * 0.75)],
+    ['Бізнес витрати (12%)', roundMoney_(totalProfitAfterVat * 0.12)],
+    ['Зарплата (7%)', roundMoney_(totalProfitAfterVat * 0.07)],
+    ['Інше (6%)', roundMoney_(totalProfitAfterVat * 0.06)]
+  ]);
+  sheet.getRange(splitHeaderRow + 2, 2, 4, 1).setNumberFormat('€#,##0.00');
+
+  const vatStatusRow = splitHeaderRow + 8;
+  const vatDiff = roundMoney_(totals.vatToPay - totals.vatPaid);
+  sheet.getRange(vatStatusRow, 1).setValue('Статус НДС').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(vatStatusRow + 1, 1, 1, 3).setValues([['НДС до сплати', 'Вже сплачено', 'Різниця']]).setFontWeight('bold').setBackground('#fce5cd');
+  sheet.getRange(vatStatusRow + 2, 1, 1, 3).setValues([[roundMoney_(totals.vatToPay), roundMoney_(totals.vatPaid), vatDiff]]).setNumberFormat('€#,##0.00').setFontWeight('bold');
+
+  const statusCell = sheet.getRange(vatStatusRow + 2, 3);
+  if (vatDiff > 0.01) statusCell.setBackground('#f4cccc').setFontColor('#b71c1c');
+  else statusCell.setBackground('#d9ead3').setFontColor('#1b5e20');
+}
+
+function renderDashboardCharts_(sheet, rows) {
+  if (!rows.length) return;
+  const firstDataRow = 17;
+  const rowCount = rows.length;
+
+  const profitChart = sheet.newChart()
+    .asLineChart()
+    .addRange(sheet.getRange(firstDataRow, 1, rowCount, 2))
+    .setOption('title', 'Тренд прибутку по місяцях')
+    .setOption('legend', { position: 'bottom' })
+    .setPosition(4, 8, 0, 0)
+    .build();
+  sheet.insertChart(profitChart);
+
+  const vatChart = sheet.newChart()
+    .asLineChart()
+    .addRange(sheet.getRange(firstDataRow, 1, rowCount, 3))
+    .setOption('title', 'Тренд НДС по місяцях')
+    .setOption('legend', { position: 'bottom' })
+    .setPosition(20, 8, 0, 0)
+    .build();
+  sheet.insertChart(vatChart);
 }
