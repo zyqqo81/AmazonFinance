@@ -5642,6 +5642,53 @@ function renderEmptyDashboard_(sheet) {
   sheet.autoResizeColumns(1, 4);
 }
 
+function getDashboardFundAllocationRules_() {
+  return [
+    { category: 'Реінвест (75%)', share: 0.75 },
+    { category: 'Бізнес витрати (12%)', share: 0.12 },
+    { category: 'Зарплата (7%)', share: 0.07 },
+    { category: 'Інше (6%)', share: 0.06 }
+  ];
+}
+
+function calculateDashboardFundAllocatedByCategory_(totalProfitAfterVat) {
+  const rules = getDashboardFundAllocationRules_();
+  const out = {};
+  for (let i = 0; i < rules.length; i++) {
+    out[rules[i].category] = roundMoney_(totalProfitAfterVat * rules[i].share);
+  }
+  return out;
+}
+
+function aggregateManualExpensesForDashboardByCategory_(manualByCategoryAgg) {
+  const categories = getManualExpenseFundCategories_();
+  const out = buildManualExpenseFundCategoryTotalsSkeleton_();
+  const totals = (manualByCategoryAgg && manualByCategoryAgg.totalsByCategory) ? manualByCategoryAgg.totalsByCategory : {};
+  for (let i = 0; i < categories.length; i++) {
+    const category = categories[i];
+    out[category] = roundMoney_(totals[category] || 0);
+  }
+  return out;
+}
+
+function calculateDashboardFundCategoryBalanceRows_(allocatedByCategory, spentByCategory) {
+  const categories = getManualExpenseFundCategories_();
+  const out = [];
+  for (let i = 0; i < categories.length; i++) {
+    const category = categories[i];
+    const allocated = roundMoney_((allocatedByCategory || {})[category] || 0);
+    const spent = roundMoney_((spentByCategory || {})[category] || 0);
+    const remaining = roundMoney_(allocated - spent);
+    out.push({
+      category: category,
+      allocated: allocated,
+      spent: spent,
+      remaining: remaining
+    });
+  }
+  return out;
+}
+
 function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
   const totals = rows.reduce(function(acc, row) {
     acc.profitBeforeVat += row.profitBeforeVat;
@@ -5697,40 +5744,33 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
   sheet.getRange(17, 1, tableRows.length, 1).setNumberFormat('@');
   sheet.getRange(17, 2, tableRows.length, 4).setNumberFormat('€#,##0.00');
 
-  const splitHeaderRow = 17 + tableRows.length + 2;
-  sheet.getRange(splitHeaderRow, 1).setValue('Фінансовий розподіл від загального прибутку після НДС').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(splitHeaderRow + 1, 1, 1, 2).setValues([['Категорія', 'Сума']]).setFontWeight('bold').setBackground('#fff2cc');
-  sheet.getRange(splitHeaderRow + 2, 1, 4, 2).setValues([
-    ['Реінвест (75%)', roundMoney_(totalProfitAfterVat * 0.75)],
-    ['Бізнес витрати (12%)', roundMoney_(totalProfitAfterVat * 0.12)],
-    ['Зарплата (7%)', roundMoney_(totalProfitAfterVat * 0.07)],
-    ['Інше (6%)', roundMoney_(totalProfitAfterVat * 0.06)]
-  ]);
-  sheet.getRange(splitHeaderRow + 2, 2, 4, 1).setNumberFormat('€#,##0.00');
+  const combinedHeaderRow = 17 + tableRows.length + 2;
+  sheet.getRange(combinedHeaderRow, 1).setValue('Фінансовий розподіл по категоріях').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(combinedHeaderRow + 1, 1, 1, 4)
+    .setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']])
+    .setFontWeight('bold')
+    .setBackground('#fff2cc');
 
-  const manualCategoryAgg = manualByCategoryAgg || { totalsByCategory: buildManualExpenseFundCategoryTotalsSkeleton_(), byMonth: {} };
-  const manualCategories = getManualExpenseFundCategories_();
-  const manualBlockHeaderRow = splitHeaderRow + 8;
-  sheet.getRange(manualBlockHeaderRow, 1).setValue('Ручні витрати за категоріями').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(manualBlockHeaderRow + 1, 1, 1, 3).setValues([['Категорія коштів', 'Сума за весь період', 'Сума за останній місяць']]).setFontWeight('bold').setBackground('#d0e0e3');
+  const allocatedByCategory = calculateDashboardFundAllocatedByCategory_(totalProfitAfterVat);
+  const spentByCategory = aggregateManualExpensesForDashboardByCategory_(manualByCategoryAgg);
+  const categoryBalanceRows = calculateDashboardFundCategoryBalanceRows_(allocatedByCategory, spentByCategory);
+  const renderedCategoryRows = categoryBalanceRows.map(function(item) {
+    return [item.category, item.allocated, item.spent, item.remaining];
+  });
 
-  const latestMonthKey = latest.month;
-  const latestMonthCategoryTotals = (manualCategoryAgg.byMonth && manualCategoryAgg.byMonth[latestMonthKey] && manualCategoryAgg.byMonth[latestMonthKey].categories)
-    ? manualCategoryAgg.byMonth[latestMonthKey].categories
-    : buildManualExpenseFundCategoryTotalsSkeleton_();
-  const manualCategoryRows = [];
-  for (let mc = 0; mc < manualCategories.length; mc++) {
-    const category = manualCategories[mc];
-    manualCategoryRows.push([
-      category,
-      roundMoney_((manualCategoryAgg.totalsByCategory || {})[category] || 0),
-      roundMoney_(latestMonthCategoryTotals[category] || 0)
-    ]);
+  sheet.getRange(combinedHeaderRow + 2, 1, renderedCategoryRows.length, 4).setValues(renderedCategoryRows);
+  sheet.getRange(combinedHeaderRow + 2, 2, renderedCategoryRows.length, 3).setNumberFormat('€#,##0.00');
+
+  for (let r = 0; r < categoryBalanceRows.length; r++) {
+    const remainingCell = sheet.getRange(combinedHeaderRow + 2 + r, 4);
+    if (categoryBalanceRows[r].remaining < 0) {
+      remainingCell.setBackground('#f4cccc').setFontColor('#b71c1c').setFontWeight('bold');
+    } else {
+      remainingCell.setBackground('#ffffff').setFontColor('#1b5e20');
+    }
   }
-  sheet.getRange(manualBlockHeaderRow + 2, 1, manualCategoryRows.length, 3).setValues(manualCategoryRows);
-  sheet.getRange(manualBlockHeaderRow + 2, 2, manualCategoryRows.length, 2).setNumberFormat('€#,##0.00');
 
-  const vatStatusRow = manualBlockHeaderRow + 8;
+  const vatStatusRow = combinedHeaderRow + 2 + renderedCategoryRows.length + 2;
   const vatDiff = roundMoney_(totals.vatToPay - totals.vatPaid);
   sheet.getRange(vatStatusRow, 1).setValue('Статус НДС').setFontWeight('bold').setFontSize(13);
   sheet.getRange(vatStatusRow + 1, 1, 1, 3).setValues([['НДС до сплати', 'Вже сплачено', 'Різниця']]).setFontWeight('bold').setBackground('#fce5cd');
