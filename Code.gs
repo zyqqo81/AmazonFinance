@@ -4584,6 +4584,78 @@ function getManualOperationsData_() {
   return getManualExpensesData_();
 }
 
+function readManualExpensesRowsForDashboard_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(getManualExpensesSheetName_());
+  const headers = getManualExpensesHeaders_();
+  if (!sh || sh.getLastRow() < 2 || sh.getLastColumn() < 1) return [];
+
+  const width = sh.getLastColumn();
+  const values = sh.getRange(1, 1, sh.getLastRow(), width).getValues();
+  const headerRow = values[0].map(function(v) { return String(v || '').trim(); });
+  const headerMap = {};
+  for (let i = 0; i < headerRow.length; i++) {
+    if (headerRow[i]) headerMap[headerRow[i]] = i;
+  }
+
+  const out = [];
+  for (let r = 1; r < values.length; r++) {
+    const sourceRow = values[r];
+    const rowObj = {};
+    for (let h = 0; h < headers.length; h++) {
+      const header = headers[h];
+      const idx = headerMap[header];
+      rowObj[header] = idx === undefined ? '' : sourceRow[idx];
+    }
+    rowObj.__rowNumber = r + 1;
+    rowObj.__active = isManualOperationActive_(rowObj['Активно']);
+    rowObj.__month = deriveManualExpenseMonthKey_(rowObj['Місяць']) || deriveManualExpenseMonthKey_(rowObj['Дата']) || '';
+    rowObj.__netAmount = parseNumberFlexible_(rowObj['Сума без НДС']);
+    rowObj.__vatAmount = parseNumberFlexible_(rowObj['Сума НДС']);
+    rowObj.__grossAmount = parseNumberFlexible_(rowObj['Сума з НДС']);
+    rowObj.__effectiveAmount = rowObj.__netAmount || rowObj.__grossAmount || 0;
+    rowObj.__fundCategory = normalizeManualExpenseFundCategory_(rowObj['Категорія коштів']);
+    rowObj.__hasKnownFundCategory = isKnownManualExpenseFundCategory_(rowObj.__fundCategory);
+    out.push(rowObj);
+  }
+
+  return out;
+}
+
+function collectManualExpenseCategoryTotalsForDashboard_() {
+  const rows = readManualExpensesRowsForDashboard_();
+  const totalsByCategory = buildManualExpenseFundCategoryTotalsSkeleton_();
+  const byMonth = {};
+  const warnings = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row.__active || !row.__month || !row.__effectiveAmount) continue;
+    const category = readManualExpenseFundCategory_(row);
+    if (!category || !isKnownManualExpenseFundCategory_(category)) continue;
+
+    if (!byMonth[row.__month]) byMonth[row.__month] = { total: 0, categories: buildManualExpenseFundCategoryTotalsSkeleton_(), rows: 0 };
+    byMonth[row.__month].categories[category] = roundMoney_((byMonth[row.__month].categories[category] || 0) + row.__effectiveAmount);
+    byMonth[row.__month].total = roundMoney_(byMonth[row.__month].total + row.__effectiveAmount);
+    byMonth[row.__month].rows += 1;
+    totalsByCategory[category] = roundMoney_((totalsByCategory[category] || 0) + row.__effectiveAmount);
+  }
+
+  const months = Object.keys(byMonth).sort();
+  for (let m = 0; m < months.length; m++) {
+    const monthKey = months[m];
+    const monthBucket = byMonth[monthKey];
+    const monthTotal = monthBucket.total || 0;
+    monthBucket.shares = {};
+    const categories = getManualExpenseFundCategories_();
+    for (let c = 0; c < categories.length; c++) {
+      const cat = categories[c];
+      monthBucket.shares[cat] = monthTotal > 0 ? roundMoney_((monthBucket.categories[cat] || 0) / monthTotal * 100) : 0;
+    }
+  }
+
+  return { byMonth: byMonth, totalsByCategory: totalsByCategory, warnings: warnings };
+}
+
 function validateManualExpenseRows_() {
   const data = getManualExpensesData_();
   const stats = {
@@ -5546,7 +5618,7 @@ function rebuildDashboard_() {
     return 0;
   });
 
-  const manualByCategory = collectManualExpensesByFundCategoryByMonth_();
+  const manualByCategory = collectManualExpenseCategoryTotalsForDashboard_();
   renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory);
   renderDashboardCharts_(dashboard, monthlyRows);
   dashboard.autoResizeColumns(1, 8);
