@@ -4629,6 +4629,79 @@ function collectManualOperationsByMonth_() {
   return collectManualExpensesByMonth_();
 }
 
+function validateManualExpenseVatRows_() {
+  return collectManualExpenseVatByMonth_().stats;
+}
+
+function collectManualExpenseVatByMonth_() {
+  const data = getManualExpensesData_();
+  const out = {};
+  const warnings = [];
+  const stats = {
+    totalRows: data.rows.length,
+    activeRows: 0,
+    includedRows: 0,
+    skippedInactive: 0,
+    skippedInvalidDate: 0,
+    skippedMissingVat: 0,
+    totalsByMonth: {}
+  };
+
+  for (let i = 0; i < data.rows.length; i++) {
+    const row = data.rows[i];
+    if (!row.__active) {
+      stats.skippedInactive += 1;
+      continue;
+    }
+    stats.activeRows += 1;
+
+    if (!row.__month) {
+      stats.skippedInvalidDate += 1;
+      warnings.push('РУЧНІ_ВИТРАТИ рядок ' + row.__rowNumber + ': пропущено НДС через невалідну дату або місяць.');
+      continue;
+    }
+
+    const vat = parseNumberFlexible_(row['Сума НДС']);
+    if (!(vat > 0)) {
+      stats.skippedMissingVat += 1;
+      continue;
+    }
+
+    if (!out[row.__month]) out[row.__month] = { vat: 0, rows: 0 };
+    out[row.__month].vat = roundMoney_(out[row.__month].vat + vat);
+    out[row.__month].rows += 1;
+
+    stats.includedRows += 1;
+    stats.totalsByMonth[row.__month] = roundMoney_((stats.totalsByMonth[row.__month] || 0) + vat);
+  }
+
+  return { byMonth: out, warnings: warnings, stats: stats };
+}
+
+function getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth) {
+  return roundMoney_(((manualExpenseVatByMonth || {})[month] || { vat: 0 }).vat || 0);
+}
+
+function getPaidVatBreakdownForMonth_(month, manualVatByMonth, manualExpenseVatByMonth) {
+  const manualInputVat = roundMoney_(((manualVatByMonth || {})[month] || { paidVat: 0 }).paidVat || 0);
+  const manualExpenseVat = getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {});
+  const totalPaidVat = roundMoney_(manualInputVat + manualExpenseVat);
+  return {
+    manualInputVat: manualInputVat,
+    manualExpenseVat: manualExpenseVat,
+    totalPaidVat: totalPaidVat
+  };
+}
+
+function rebuildPaidVatSection_(row, paidVatBreakdown) {
+  const breakdown = paidVatBreakdown || { manualInputVat: 0, manualExpenseVat: 0, totalPaidVat: 0 };
+  row[11] = roundMoney_(breakdown.totalPaidVat);
+  row[17] = roundMoney_(breakdown.manualInputVat);
+  row[18] = roundMoney_(breakdown.manualExpenseVat);
+  row[19] = roundMoney_(breakdown.totalPaidVat);
+  return row;
+}
+
 function readLegacyBusinessExpensesByMonth_() {
   const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.LEGACY_BUSINESS_EXPENSES_SHEET);
   if (!sh || sh.getLastRow() < 2) return { byMonth: {}, warnings: [] };
@@ -4831,15 +4904,16 @@ function rebuildLatestMonthOnly_() {
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
   const manualExpenses = collectManualExpensesByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))
   );
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth, manualExpenseVat.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getMonthlyVatPayoutSheet_();
@@ -4861,15 +4935,16 @@ function rebuildMonthlyVatPayoutSummary_() {
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
   const manualExpenses = collectManualExpensesByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))
   );
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth, manualExpenseVat.byMonth);
   });
 
   const sh = getMonthlyVatPayoutSheet_();
@@ -4903,15 +4978,19 @@ function monthlyVatPayoutHeaders_() {
     'Залишок після НДС',
     'К-сть settlement файлів',
     'К-сть sales файлів',
-    'Примітки'
+    'Примітки',
+    'Вже сплачений НДС (введення)',
+    'Вже сплачений НДС (з ручних витрат)',
+    'Вже сплачений НДС (разом)'
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpensesByMonth) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpensesByMonth, manualExpenseVatByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
   const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
-  const paidVat = (manualVatByMonth[month] || { paidVat: 0 }).paidVat;
+  const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, manualVatByMonth, manualExpenseVatByMonth);
+  const paidVat = paidVatBreakdown.totalPaidVat;
   const settlementFees = (settlementFeesByMonth[month] || { fees: 0 }).fees;
   const hasManualFees = !!manualFeesByMonth[month];
   const fees = hasManualFees ? manualFeesByMonth[month].fees : settlementFees;
@@ -4940,9 +5019,13 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, 
     roundMoney_(profitBeforeVat - roundMoney_(s.vatPayable - paidVat)),
     settlementCount,
     salesFileCount,
-    notes
+    notes,
+    0,
+    0,
+    0
   ];
 
+  rebuildPaidVatSection_(row, paidVatBreakdown);
   return applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth || {});
 }
 
@@ -4951,6 +5034,7 @@ function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
   safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, 1), '@', [], 'monthly.month');
   safeSetNumberFormat_(sheet.getRange(2, 2, rowCount, 13), '#,##0.00', [], 'monthly.money');
   safeSetNumberFormat_(sheet.getRange(2, 15, rowCount, 2), '0', [], 'monthly.counts');
+  safeSetNumberFormat_(sheet.getRange(2, 18, rowCount, 3), '#,##0.00', [], 'monthly.paidVatBreakdown');
 }
 
 function buildSettlementFeesByMonth_() {
@@ -5048,7 +5132,9 @@ function writeDiagnostics_() {
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
   const manualExpenses = collectManualExpensesByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonth_();
   const manualValidation = validateManualExpenseRows_();
+  const manualVatValidation = validateManualExpenseVatRows_();
   const purchasePreview = collectPurchaseRowsForSync_();
   const purchaseSync = syncManualPurchasesToZakupky_();
   const legacyStatus = inspectLegacyMonthlySheetUsage_();
@@ -5072,22 +5158,24 @@ function writeDiagnostics_() {
   }
 
   rows.push(['INFO', 'C. Підсумок по місяцях', 'Місяць', 'Виплата', 'COGS', 'Комісії settlement', 'НДС з продажів', 'Сплачений НДС', 'Ручні витрати']);
-  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenses.byMonth))))));
+  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))));
   for (let k = 0; k < months.length; k++) {
     const m = months[k];
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(m, manualVat.byMonth, manualExpenseVat.byMonth);
     rows.push(['DATA', 'C. Підсумок по місяцях', m,
       (payoutByMonth[m] || { paidOut: 0 }).paidOut,
       (cogsByMonth[m] || { cogs: 0 }).cogs,
       (settlementFees[m] || { fees: 0 }).fees,
       (salesAgg[m] || { vatPayable: 0 }).vatPayable,
-      (manualVat.byMonth[m] || { paidVat: 0 }).paidVat,
-      (manualExpenses.byMonth[m] || { amount: 0 }).amount
+      paidVatBreakdown.totalPaidVat,
+      'ручні витрати: ' + (manualExpenses.byMonth[m] || { amount: 0 }).amount
     ]);
   }
 
   rows.push(['INFO', 'D. Ручні витрати', 'Усього рядків', manualValidation.totalRows, 'Активні рядки', manualValidation.activeRows, 'У прибутку', manualValidation.includedInProfitRows, 'Неактивні: ' + manualValidation.inactiveRows]);
   rows.push(['INFO', 'D. Ручні витрати', 'Невалідні дати', manualValidation.invalidDateRows.join(', '), 'Рядки без суми', manualValidation.missingAmountRows.join(', '), 'Рядки без типу', manualValidation.missingTypeRows.join(', '), 'Закуп у постачальника: ' + manualValidation.supplierPurchaseRows]);
   rows.push(['INFO', 'D. Ручні витрати', 'Бізнес-витрата', manualValidation.businessExpenseRows, 'Попередній перегляд рядків типу закуп у постачальника', purchasePreview.rows.length, 'Синхронізація в Закупки', 'вимкнено: ' + purchaseSync.skipped]);
+  rows.push(['INFO', 'D2. НДС з ручних витрат', 'Усього рядків', manualVatValidation.totalRows, 'Активні рядки', manualVatValidation.activeRows, 'Враховано НДС рядків', manualVatValidation.includedRows, 'Пропущено: неактивні=' + manualVatValidation.skippedInactive + ', невалідна дата=' + manualVatValidation.skippedInvalidDate + ', без НДС=' + manualVatValidation.skippedMissingVat]);
 
   const manualExpenseMonths = Object.keys(manualValidation.totalsByMonth).sort();
   rows.push(['INFO', 'E. Ручні витрати по місяцях', 'Місяць', 'Сума для прибутку', 'НДС', 'Коментар', '', '', '']);
@@ -5102,6 +5190,22 @@ function writeDiagnostics_() {
     const vm = vatMonths[y];
     const v = manualVat.byMonth[vm];
     rows.push(['DATA', 'F. Ручний НДС по місяцях', vm, v.paidVat, v.rows, '', '', '', '']);
+  }
+
+  rows.push(['INFO', 'F2. НДС з ручних витрат по місяцях', 'Місяць', 'НДС з ручних витрат', 'Рядків', 'Коментар', '', '', '']);
+  const vatExpenseMonths = Object.keys(manualExpenseVat.byMonth).sort();
+  for (let y2 = 0; y2 < vatExpenseMonths.length; y2++) {
+    const vem = vatExpenseMonths[y2];
+    const ve = manualExpenseVat.byMonth[vem];
+    rows.push(['DATA', 'F2. НДС з ручних витрат по місяцях', vem, ve.vat, ve.rows, 'Активні рядки з валідною датою і НДС > 0', '', '', '']);
+  }
+
+  rows.push(['INFO', 'F3. Комбінований сплачений НДС', 'Місяць', 'НДС введення', 'НДС ручні витрати', 'Разом сплачений НДС', '', '', '']);
+  const combinedVatMonths = mergeMonthKeys_(Object.keys(manualVat.byMonth), Object.keys(manualExpenseVat.byMonth));
+  for (let y3 = 0; y3 < combinedVatMonths.length; y3++) {
+    const cvm = combinedVatMonths[y3];
+    const breakdown = getPaidVatBreakdownForMonth_(cvm, manualVat.byMonth, manualExpenseVat.byMonth);
+    rows.push(['DATA', 'F3. Комбінований сплачений НДС', cvm, breakdown.manualInputVat, breakdown.manualExpenseVat, breakdown.totalPaidVat, '', '', '']);
   }
 
   rows.push(['INFO', 'G. Ручні комісії по місяцях', 'Місяць', 'Комісії', 'Рядків', 'Попередження', '', '', '']);
@@ -5122,7 +5226,7 @@ function writeDiagnostics_() {
   if (legacyStatus.legacyExists && legacyStatus.uniqueLegacyRows > 0) rows.push(['WARN', 'I. Legacy monthly sheet', 'Legacy sheet містить рядки поза main', String(legacyStatus.uniqueLegacyRows), '', '', '', '', '']);
 
   const allWarnings = []
-    .concat(manualVat.warnings || [], manualFees.warnings || [], manualExpenses.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || []);
+    .concat(manualVat.warnings || [], manualFees.warnings || [], manualExpenses.warnings || [], manualExpenseVat.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || []);
   for (let q = 0; q < allWarnings.length; q++) {
     rows.push(['WARN', 'J. Попередження', allWarnings[q], '', '', '', '', '', '']);
   }
