@@ -4695,10 +4695,10 @@ function getPaidVatBreakdownForMonth_(month, manualVatByMonth, manualExpenseVatB
 
 function rebuildPaidVatSection_(row, paidVatBreakdown) {
   const breakdown = paidVatBreakdown || { manualInputVat: 0, manualExpenseVat: 0, totalPaidVat: 0 };
+  row[8] = roundMoney_(breakdown.manualInputVat);
+  row[9] = roundMoney_(breakdown.manualExpenseVat);
+  row[10] = roundMoney_(breakdown.totalPaidVat);
   row[11] = roundMoney_(breakdown.totalPaidVat);
-  row[17] = roundMoney_(breakdown.manualInputVat);
-  row[18] = roundMoney_(breakdown.manualExpenseVat);
-  row[19] = roundMoney_(breakdown.totalPaidVat);
   return row;
 }
 
@@ -4756,14 +4756,10 @@ function syncManualPurchasesToZakupky_() {
 }
 
 function applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth) {
-  const info = (manualExpensesByMonth && manualExpensesByMonth[month]) || { amount: 0, vat: 0 };
   const profitBeforeVat = parseNumberFlexible_(row[7]);
   const paidVat = parseNumberFlexible_(row[11]);
   const vatToPay = roundMoney_(row[3] - paidVat);
 
-  row[8] = roundMoney_(info.amount);
-  row[9] = roundMoney_(info.vat);
-  row[10] = roundMoney_(profitBeforeVat);
   row[12] = vatToPay;
   row[13] = roundMoney_(profitBeforeVat - vatToPay);
   return row;
@@ -4967,18 +4963,15 @@ function monthlyVatPayoutHeaders_() {
     'Комісії Amazon',
     'Собівартість',
     'Прибуток до НДС',
-    'Ручні витрати',
-    'НДС у ручних витратах',
-    'Прибуток після ручних витрат',
+    'Вже сплачений НДС (введення)',
+    'Вже сплачений НДС (з ручних витрат)',
+    'Вже сплачений НДС (разом)',
     'Вже сплачений НДС',
     'НДС до оплати',
     'Залишок після НДС',
     'К-сть settlement файлів',
     'К-сть sales файлів',
-    'Примітки',
-    'Вже сплачений НДС (введення)',
-    'Вже сплачений НДС (з ручних витрат)',
-    'Вже сплачений НДС (разом)'
+    'Примітки'
   ];
 }
 
@@ -5010,16 +5003,13 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, 
     profitBeforeVat,
     0,
     0,
-    profitBeforeVat,
+    0,
     paidVat,
     roundMoney_(s.vatPayable - paidVat),
     roundMoney_(profitBeforeVat - roundMoney_(s.vatPayable - paidVat)),
     settlementCount,
     salesFileCount,
-    notes,
-    0,
-    0,
-    0
+    notes
   ];
 
   rebuildPaidVatSection_(row, paidVatBreakdown);
@@ -5031,7 +5021,6 @@ function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
   safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, 1), '@', [], 'monthly.month');
   safeSetNumberFormat_(sheet.getRange(2, 2, rowCount, 13), '#,##0.00', [], 'monthly.money');
   safeSetNumberFormat_(sheet.getRange(2, 15, rowCount, 2), '0', [], 'monthly.counts');
-  safeSetNumberFormat_(sheet.getRange(2, 18, rowCount, 3), '#,##0.00', [], 'monthly.paidVatBreakdown');
 }
 
 function buildSettlementFeesByMonth_() {
