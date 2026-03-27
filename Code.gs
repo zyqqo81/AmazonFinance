@@ -4479,28 +4479,26 @@ function ensureWorkingCapitalSheet_() {
   }
 
   const hm = getHeaderMap_(sh);
-  const dataRows = Math.max(1, sh.getMaxRows() - 1);
-  if (hm['Активно']) sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
-  if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'workingCapital.date');
-  if (hm['Місяць']) {
-    safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'workingCapital.month');
-    const monthRule = SpreadsheetApp.newDataValidation()
-      .requireTextMatchesPattern('^\\d{4}-\\d{2}$')
-      .setAllowInvalid(true)
-      .build();
-    sh.getRange(2, hm['Місяць'], dataRows, 1).setDataValidation(monthRule);
-  }
+  if (created) {
+    const dataRows = Math.max(1, sh.getMaxRows() - 1);
+    if (hm['Активно']) sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
+    if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'workingCapital.date');
+    if (hm['Місяць']) {
+      safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'workingCapital.month');
+      sh.getRange(1, hm['Місяць']).setNote('Рекомендований формат: yyyy-MM. Перевірка виконується під час читання даних.');
+    }
 
-  [
-    'Собівартість товарів на Amazon',
-    'Кошти доступні на вивід Amazon',
-    'Товари готові до відправки',
-    'Кошти на руках',
-    'Можливість кредитування',
-    'Оборотний капітал'
-  ].forEach(function(header) {
-    if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '€#,##0.00', [], 'workingCapital.' + header);
-  });
+    [
+      'Собівартість товарів на Amazon',
+      'Кошти доступні на вивід Amazon',
+      'Товари готові до відправки',
+      'Кошти на руках',
+      'Можливість кредитування',
+      'Оборотний капітал'
+    ].forEach(function(header) {
+      if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '€#,##0.00', [], 'workingCapital.' + header);
+    });
+  }
 
   return { sheetName: getWorkingCapitalSheetName_(), created: created, addedHeaders: addedHeaders };
 }
@@ -4520,14 +4518,21 @@ function normalizeWorkingCapitalMonth_(monthValue, dateValue) {
 }
 
 function readWorkingCapitalRows_() {
-  ensureWorkingCapitalSheet_();
   const sh = SpreadsheetApp.getActive().getSheetByName(getWorkingCapitalSheetName_());
-  if (!sh || sh.getLastRow() < 2) return { rows: [], warnings: [] };
+  if (!sh || sh.getLastRow() < 2) return { rows: [], warnings: sh ? [] : ['Лист ' + getWorkingCapitalSheetName_() + ' не знайдено.'] };
 
   const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
   const hm = buildHeaderMapCaseInsensitive_(all[0]);
 
-  const required = getWorkingCapitalHeaders_();
+  const required = [
+    'Дата',
+    'Місяць',
+    'Собівартість товарів на Amazon',
+    'Кошти доступні на вивід Amazon',
+    'Товари готові до відправки',
+    'Кошти на руках',
+    'Можливість кредитування'
+  ];
   const missing = [];
   for (let i = 0; i < required.length; i++) {
     if (hm[normalizeHeaderKey_(required[i])] === undefined) missing.push(required[i]);
@@ -4541,20 +4546,44 @@ function readWorkingCapitalRows_() {
 
   const rows = [];
   const warnings = [];
+  const monthStats = {};
+  let invalidMonths = 0;
+  let missingMonths = 0;
+  let nonNumericValues = 0;
+
+  function parseWorkingCapitalNumber_(rawValue, rowIndex, headerName) {
+    if (rawValue === null || rawValue === undefined || rawValue === '') return 0;
+    if (typeof rawValue === 'number') return isFinite(rawValue) ? rawValue : 0;
+    const parsed = parseNumberFlexible_(rawValue);
+    if (parsed === 0) {
+      const normalized = String(rawValue).replace(/\s/g, '').replace(',', '.');
+      if (normalized !== '0' && normalized !== '0.0' && normalized !== '0.00') {
+        nonNumericValues += 1;
+        warnings.push('ОБОРОТНИЙ_КАПІТАЛ рядок ' + rowIndex + ': нечислове значення у колонці "' + headerName + '" (' + rawValue + ').');
+      }
+    }
+    return parsed;
+  }
+
   for (let i = 1; i < all.length; i++) {
     const raw = all[i];
     if (isEmptyRow_(raw)) continue;
 
     const active = manualExpenseBoolean_(val(raw, 'Активно'), true);
     const month = normalizeWorkingCapitalMonth_(val(raw, 'Місяць'), val(raw, 'Дата'));
-    const cogsAmazon = parseNumberFlexible_(val(raw, 'Собівартість товарів на Amazon'));
-    const amazonPayoutAvailable = parseNumberFlexible_(val(raw, 'Кошти доступні на вивід Amazon'));
-    const goodsReadyToShip = parseNumberFlexible_(val(raw, 'Товари готові до відправки'));
-    const cashOnHand = parseNumberFlexible_(val(raw, 'Кошти на руках'));
-    const creditCapacity = parseNumberFlexible_(val(raw, 'Можливість кредитування'));
+    const cogsAmazon = parseWorkingCapitalNumber_(val(raw, 'Собівартість товарів на Amazon'), i + 1, 'Собівартість товарів на Amazon');
+    const amazonPayoutAvailable = parseWorkingCapitalNumber_(val(raw, 'Кошти доступні на вивід Amazon'), i + 1, 'Кошти доступні на вивід Amazon');
+    const goodsReadyToShip = parseWorkingCapitalNumber_(val(raw, 'Товари готові до відправки'), i + 1, 'Товари готові до відправки');
+    const cashOnHand = parseWorkingCapitalNumber_(val(raw, 'Кошти на руках'), i + 1, 'Кошти на руках');
+    const creditCapacity = parseWorkingCapitalNumber_(val(raw, 'Можливість кредитування'), i + 1, 'Можливість кредитування');
     const total = roundMoney_(cogsAmazon + amazonPayoutAvailable + goodsReadyToShip + cashOnHand + creditCapacity);
 
-    if (active && !month) warnings.push('ОБОРОТНИЙ_КАПІТАЛ рядок ' + (i + 1) + ': невалідний місяць (очікується yyyy-MM).');
+    if (active && !month) {
+      const rawMonth = String(val(raw, 'Місяць') || '').trim();
+      if (!rawMonth) missingMonths += 1;
+      else invalidMonths += 1;
+      warnings.push('ОБОРОТНИЙ_КАПІТАЛ рядок ' + (i + 1) + ': невалідний місяць (очікується yyyy-MM).');
+    }
 
     rows.push({
       rowNumber: i + 1,
@@ -4570,9 +4599,24 @@ function readWorkingCapitalRows_() {
       note: val(raw, 'Примітки'),
       active: active
     });
+
+    if (active && month) {
+      if (!monthStats[month]) monthStats[month] = { rows: 0, total: 0 };
+      monthStats[month].rows += 1;
+      monthStats[month].total = roundMoney_(monthStats[month].total + total);
+    }
   }
 
-  return { rows: rows, warnings: warnings };
+  return {
+    rows: rows,
+    warnings: warnings,
+    stats: {
+      invalidMonths: invalidMonths,
+      missingMonths: missingMonths,
+      nonNumericValues: nonNumericValues,
+      totalsByMonth: monthStats
+    }
+  };
 }
 
 function collectWorkingCapitalByMonth_() {
@@ -4609,7 +4653,14 @@ function collectWorkingCapitalByMonth_() {
 
   const months = Object.keys(byMonth).sort();
   const list = months.map(function(month) { return byMonth[month]; });
-  return { byMonth: byMonth, months: months, rows: list, activeRows: activeRows, warnings: parsed.warnings || [] };
+  return {
+    byMonth: byMonth,
+    months: months,
+    rows: list,
+    activeRows: activeRows,
+    warnings: parsed.warnings || [],
+    diagnostics: parsed.stats || { invalidMonths: 0, missingMonths: 0, nonNumericValues: 0, totalsByMonth: {} }
+  };
 }
 
 function getLatestWorkingCapitalMonth_(agg) {
@@ -5646,11 +5697,21 @@ function writeDiagnostics_() {
 
   rows.push(['INFO', 'G3. Оборотний капітал', 'Активних рядків', workingCapitalAgg.activeRows || 0, 'Активних місяців', (workingCapitalAgg.months || []).length, 'Поточний місяць', workingCapitalTotals.latestMonth || '', '']);
   rows.push(['INFO', 'G3. Оборотний капітал', 'Поточний оборотний капітал', roundMoney_(workingCapitalTotals.currentWorkingCapital || 0), 'Середній оборотний капітал', roundMoney_(workingCapitalTotals.averageWorkingCapital || 0), 'Зміна до попереднього місяця', roundMoney_(workingCapitalTotals.changeVsPreviousMonth || 0), '']);
+  const wcDiag = (workingCapitalAgg && workingCapitalAgg.diagnostics) ? workingCapitalAgg.diagnostics : {};
+  rows.push(['INFO', 'G3. Оборотний капітал', 'Невалідні місяці', wcDiag.invalidMonths || 0, 'Пропущені місяці', wcDiag.missingMonths || 0, 'Нечислові значення', wcDiag.nonNumericValues || 0, '']);
   rows.push(['INFO', 'G3. Оборотний капітал по місяцях', 'Місяць', 'Собівартість товарів на Amazon', 'Кошти доступні на вивід Amazon', 'Товари готові до відправки', 'Кошти на руках', 'Можливість кредитування', 'Оборотний капітал']);
   for (let wc = 0; wc < (workingCapitalAgg.months || []).length; wc++) {
     const wcMonth = workingCapitalAgg.months[wc];
     const wcData = (workingCapitalAgg.byMonth || {})[wcMonth] || {};
     rows.push(['DATA', 'G3. Оборотний капітал по місяцях', wcMonth, wcData.cogsAmazon || 0, wcData.amazonPayoutAvailable || 0, wcData.goodsReadyToShip || 0, wcData.cashOnHand || 0, wcData.creditCapacity || 0, wcData.workingCapital || 0]);
+  }
+  rows.push(['INFO', 'G3. Оборотний капітал totals by month', 'Місяць', 'Активних рядків', 'Разом оборотний капітал', '', '', '', '']);
+  const wcTotalsByMonth = (wcDiag && wcDiag.totalsByMonth) ? wcDiag.totalsByMonth : {};
+  const wcDiagMonths = Object.keys(wcTotalsByMonth).sort();
+  for (let wdm = 0; wdm < wcDiagMonths.length; wdm++) {
+    const m = wcDiagMonths[wdm];
+    const md = wcTotalsByMonth[m] || { rows: 0, total: 0 };
+    rows.push(['DATA', 'G3. Оборотний капітал totals by month', m, md.rows || 0, roundMoney_(md.total || 0), '', '', '', '']);
   }
 
   const unique = buildSalesTaxUniques_();
@@ -6191,4 +6252,3 @@ function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
     sheet.insertChart(workingCapitalChart);
   }
 }
-
