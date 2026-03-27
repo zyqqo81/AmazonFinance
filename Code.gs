@@ -4759,14 +4759,13 @@ function applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth) 
   const info = (manualExpensesByMonth && manualExpensesByMonth[month]) || { amount: 0, vat: 0 };
   const profitBeforeVat = parseNumberFlexible_(row[7]);
   const paidVat = parseNumberFlexible_(row[11]);
-  const profitAfterManualExpenses = roundMoney_(profitBeforeVat - info.amount);
   const vatToPay = roundMoney_(row[3] - paidVat);
 
   row[8] = roundMoney_(info.amount);
   row[9] = roundMoney_(info.vat);
-  row[10] = profitAfterManualExpenses;
+  row[10] = roundMoney_(profitBeforeVat);
   row[12] = vatToPay;
-  row[13] = roundMoney_(profitAfterManualExpenses - vatToPay);
+  row[13] = roundMoney_(profitBeforeVat - vatToPay);
   return row;
 }
 
@@ -4903,17 +4902,16 @@ function rebuildLatestMonthOnly_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const manualExpenses = collectManualExpensesByMonth_();
   const manualExpenseVat = collectManualExpenseVatByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenseVat.byMonth))))
   );
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth, manualExpenseVat.byMonth);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getMonthlyVatPayoutSheet_();
@@ -4934,17 +4932,16 @@ function rebuildMonthlyVatPayoutSummary_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const manualExpenses = collectManualExpensesByMonth_();
   const manualExpenseVat = collectManualExpenseVatByMonth_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
-    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))
+    mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), Object.keys(manualExpenseVat.byMonth))))
   );
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenses.byMonth, manualExpenseVat.byMonth);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFees, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth);
   });
 
   const sh = getMonthlyVatPayoutSheet_();
@@ -4985,7 +4982,7 @@ function monthlyVatPayoutHeaders_() {
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpensesByMonth, manualExpenseVatByMonth) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpenseVatByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
   const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
@@ -5026,7 +5023,7 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFeesByMonth, 
   ];
 
   rebuildPaidVatSection_(row, paidVatBreakdown);
-  return applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth || {});
+  return applyManualExpensesToMonthlyReport_(row, month, {});
 }
 
 function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
