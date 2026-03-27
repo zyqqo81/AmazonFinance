@@ -10,6 +10,7 @@ const CONFIG = {
   PURCHASES_SHEET: 'Закупки',
   MANUAL_EXPENSES_SHEET: 'РУЧНІ_ВИТРАТИ',
   MANUAL_OPERATIONS_SHEET: 'РУЧНІ_ОПЕРАЦІЇ',
+  WORKING_CAPITAL_SHEET: 'ОБОРОТНИЙ_КАПІТАЛ',
   LEGACY_BUSINESS_EXPENSES_SHEET: 'ВИТРАТИ_БІЗНЕСУ',
   TZ: 'Europe/Rome',
   TOTAL_FILE_ID: '__TOTAL__',
@@ -4143,6 +4144,7 @@ function getLocalizedMenuConfig_() {
       { label: 'Імпортувати останній звіт продажів', functionName: 'menuImportLatestSalesTaxReport_' },
       { separator: true },
       { label: 'Ініціалізувати лист ручних витрат', functionName: 'menuEnsureManualExpensesSheet_' },
+      { label: 'Підготувати лист оборотного капіталу', functionName: 'menuEnsureWorkingCapitalSheet_' },
       { label: 'Оновити лист введення НДС', functionName: 'menuEnsureManualVatSheet_' },
       { label: 'Оновити лист введення комісій', functionName: 'menuEnsureManualFeesSheet_' },
       { separator: true },
@@ -4202,6 +4204,21 @@ function menuEnsureManualExpensesSheet_() {
 function menuEnsureManualOperationsSheet_() {
   return menuEnsureManualExpensesSheet_();
 }
+function menuEnsureWorkingCapitalSheet_() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = ensureWorkingCapitalSheet_();
+    ui.alert([
+      'Лист оборотного капіталу готовий.',
+      'Лист: ' + res.sheetName,
+      'Створено: ' + (res.created ? 'так' : 'ні'),
+      'Додано заголовків: ' + res.addedHeaders
+    ].join('\n'));
+  } catch (e) {
+    ui.alert('Помилка підготовки листа оборотного капіталу: ' + toErrorMessage_(e));
+  }
+}
+
 
 function menuSyncManualPurchases_() {
   const ui = SpreadsheetApp.getUi();
@@ -4414,6 +4431,213 @@ function ensureManualExpensesSheet_() {
 
 function ensureManualOperationsSheet_() {
   return ensureManualExpensesSheet_();
+}
+
+function getWorkingCapitalSheetName_() {
+  return CONFIG.WORKING_CAPITAL_SHEET || 'ОБОРОТНИЙ_КАПІТАЛ';
+}
+
+function getWorkingCapitalHeaders_() {
+  return [
+    'ID',
+    'Дата',
+    'Місяць',
+    'Собівартість товарів на Amazon',
+    'Кошти доступні на вивід Amazon',
+    'Товари готові до відправки',
+    'Кошти на руках',
+    'Можливість кредитування',
+    'Оборотний капітал',
+    'Примітки',
+    'Активно'
+  ];
+}
+
+function ensureWorkingCapitalSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(getWorkingCapitalSheetName_());
+  const created = !sh;
+  if (!sh) sh = ss.insertSheet(getWorkingCapitalSheetName_());
+
+  const headers = getWorkingCapitalHeaders_();
+  let addedHeaders = 0;
+  const maxCols = Math.max(sh.getLastColumn() || 1, headers.length);
+  const row1 = sh.getRange(1, 1, 1, maxCols).getValues()[0].map(function(v) { return String(v || '').trim(); });
+
+  if (sh.getLastRow() === 0 || row1.join('') === '') {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    addedHeaders = headers.length;
+  } else {
+    let appendAt = sh.getLastColumn();
+    for (let i = 0; i < headers.length; i++) {
+      if (row1.indexOf(headers[i]) === -1) {
+        appendAt += 1;
+        sh.getRange(1, appendAt).setValue(headers[i]);
+        addedHeaders += 1;
+      }
+    }
+  }
+
+  const hm = getHeaderMap_(sh);
+  const dataRows = Math.max(1, sh.getMaxRows() - 1);
+  if (hm['Активно']) sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
+  if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'workingCapital.date');
+  if (hm['Місяць']) {
+    safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'workingCapital.month');
+    const monthRule = SpreadsheetApp.newDataValidation()
+      .requireTextMatchesPattern('^\\d{4}-\\d{2}$')
+      .setAllowInvalid(true)
+      .build();
+    sh.getRange(2, hm['Місяць'], dataRows, 1).setDataValidation(monthRule);
+  }
+
+  [
+    'Собівартість товарів на Amazon',
+    'Кошти доступні на вивід Amazon',
+    'Товари готові до відправки',
+    'Кошти на руках',
+    'Можливість кредитування',
+    'Оборотний капітал'
+  ].forEach(function(header) {
+    if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '€#,##0.00', [], 'workingCapital.' + header);
+  });
+
+  return { sheetName: getWorkingCapitalSheetName_(), created: created, addedHeaders: addedHeaders };
+}
+
+function normalizeWorkingCapitalMonth_(monthValue, dateValue) {
+  const direct = String(monthValue || '').trim();
+  if (/^\d{4}-\d{2}$/.test(direct)) return direct;
+
+  const fromDate = parseDateFlexible_(dateValue, CONFIG.TZ, {});
+  if (fromDate instanceof Date && !isNaN(fromDate.getTime())) {
+    return Utilities.formatDate(fromDate, CONFIG.TZ, 'yyyy-MM');
+  }
+
+  const normalized = toMonthText_(monthValue);
+  if (normalized && /^\d{4}-\d{2}$/.test(normalized)) return normalized;
+  return '';
+}
+
+function readWorkingCapitalRows_() {
+  ensureWorkingCapitalSheet_();
+  const sh = SpreadsheetApp.getActive().getSheetByName(getWorkingCapitalSheetName_());
+  if (!sh || sh.getLastRow() < 2) return { rows: [], warnings: [] };
+
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(all[0]);
+
+  const required = getWorkingCapitalHeaders_();
+  const missing = [];
+  for (let i = 0; i < required.length; i++) {
+    if (hm[normalizeHeaderKey_(required[i])] === undefined) missing.push(required[i]);
+  }
+  if (missing.length) throw new Error('У ' + getWorkingCapitalSheetName_() + ' відсутні колонки: ' + missing.join(', '));
+
+  function val(row, header) {
+    const idx = hm[normalizeHeaderKey_(header)];
+    return idx === undefined ? '' : row[idx];
+  }
+
+  const rows = [];
+  const warnings = [];
+  for (let i = 1; i < all.length; i++) {
+    const raw = all[i];
+    if (isEmptyRow_(raw)) continue;
+
+    const active = manualExpenseBoolean_(val(raw, 'Активно'), true);
+    const month = normalizeWorkingCapitalMonth_(val(raw, 'Місяць'), val(raw, 'Дата'));
+    const cogsAmazon = parseNumberFlexible_(val(raw, 'Собівартість товарів на Amazon'));
+    const amazonPayoutAvailable = parseNumberFlexible_(val(raw, 'Кошти доступні на вивід Amazon'));
+    const goodsReadyToShip = parseNumberFlexible_(val(raw, 'Товари готові до відправки'));
+    const cashOnHand = parseNumberFlexible_(val(raw, 'Кошти на руках'));
+    const creditCapacity = parseNumberFlexible_(val(raw, 'Можливість кредитування'));
+    const total = roundMoney_(cogsAmazon + amazonPayoutAvailable + goodsReadyToShip + cashOnHand + creditCapacity);
+
+    if (active && !month) warnings.push('ОБОРОТНИЙ_КАПІТАЛ рядок ' + (i + 1) + ': невалідний місяць (очікується yyyy-MM).');
+
+    rows.push({
+      rowNumber: i + 1,
+      id: String(val(raw, 'ID') || '').trim(),
+      date: val(raw, 'Дата'),
+      month: month,
+      cogsAmazon: cogsAmazon,
+      amazonPayoutAvailable: amazonPayoutAvailable,
+      goodsReadyToShip: goodsReadyToShip,
+      cashOnHand: cashOnHand,
+      creditCapacity: creditCapacity,
+      workingCapital: total,
+      note: val(raw, 'Примітки'),
+      active: active
+    });
+  }
+
+  return { rows: rows, warnings: warnings };
+}
+
+function collectWorkingCapitalByMonth_() {
+  const parsed = readWorkingCapitalRows_();
+  const byMonth = {};
+  let activeRows = 0;
+
+  for (let i = 0; i < parsed.rows.length; i++) {
+    const row = parsed.rows[i];
+    if (!row.active || !row.month) continue;
+    activeRows += 1;
+
+    if (!byMonth[row.month]) {
+      byMonth[row.month] = {
+        month: row.month,
+        cogsAmazon: 0,
+        amazonPayoutAvailable: 0,
+        goodsReadyToShip: 0,
+        cashOnHand: 0,
+        creditCapacity: 0,
+        workingCapital: 0,
+        rows: 0
+      };
+    }
+
+    byMonth[row.month].cogsAmazon = roundMoney_(byMonth[row.month].cogsAmazon + row.cogsAmazon);
+    byMonth[row.month].amazonPayoutAvailable = roundMoney_(byMonth[row.month].amazonPayoutAvailable + row.amazonPayoutAvailable);
+    byMonth[row.month].goodsReadyToShip = roundMoney_(byMonth[row.month].goodsReadyToShip + row.goodsReadyToShip);
+    byMonth[row.month].cashOnHand = roundMoney_(byMonth[row.month].cashOnHand + row.cashOnHand);
+    byMonth[row.month].creditCapacity = roundMoney_(byMonth[row.month].creditCapacity + row.creditCapacity);
+    byMonth[row.month].workingCapital = roundMoney_(byMonth[row.month].workingCapital + row.workingCapital);
+    byMonth[row.month].rows += 1;
+  }
+
+  const months = Object.keys(byMonth).sort();
+  const list = months.map(function(month) { return byMonth[month]; });
+  return { byMonth: byMonth, months: months, rows: list, activeRows: activeRows, warnings: parsed.warnings || [] };
+}
+
+function getLatestWorkingCapitalMonth_(agg) {
+  const months = (agg && agg.months ? agg.months : Object.keys((agg && agg.byMonth) || {})).slice().sort();
+  return months.length ? months[months.length - 1] : '';
+}
+
+function getWorkingCapitalTotals_(agg) {
+  const rows = (agg && agg.rows) ? agg.rows : [];
+  const latestMonth = getLatestWorkingCapitalMonth_(agg);
+  const latest = latestMonth ? (agg.byMonth || {})[latestMonth] : null;
+  const previous = latestMonth && agg.months && agg.months.length > 1 ? agg.byMonth[agg.months[agg.months.length - 2]] : null;
+
+  let total = 0;
+  for (let i = 0; i < rows.length; i++) total += rows[i].workingCapital;
+
+  const average = rows.length ? roundMoney_(total / rows.length) : 0;
+  const current = latest ? roundMoney_(latest.workingCapital) : 0;
+  const changeVsPrev = roundMoney_(current - (previous ? previous.workingCapital : 0));
+
+  return {
+    latestMonth: latestMonth,
+    currentWorkingCapital: current,
+    averageWorkingCapital: average,
+    changeVsPreviousMonth: previous ? changeVsPrev : current,
+    previousMonth: previous ? previous.month : '',
+    latestBreakdown: latest || null
+  };
 }
 
 function rowArrayToObject_(row, headers) {
@@ -5321,6 +5545,8 @@ function writeDiagnostics_() {
   const manualVatValidation = validateManualExpenseVatRows_();
   const purchasePreview = collectPurchaseRowsForSync_();
   const purchaseSync = syncManualPurchasesToZakupky_();
+  const workingCapitalAgg = collectWorkingCapitalByMonth_();
+  const workingCapitalTotals = getWorkingCapitalTotals_(workingCapitalAgg);
   const legacyStatus = inspectLegacyMonthlySheetUsage_();
 
   rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'Назва файлу', 'Дата виплати', 'Ефективна posted date', 'Призначений місяць', 'Виплата', 'COGS | Комісії']);
@@ -5417,6 +5643,16 @@ function writeDiagnostics_() {
     }
   }
 
+
+  rows.push(['INFO', 'G3. Оборотний капітал', 'Активних рядків', workingCapitalAgg.activeRows || 0, 'Активних місяців', (workingCapitalAgg.months || []).length, 'Поточний місяць', workingCapitalTotals.latestMonth || '', '']);
+  rows.push(['INFO', 'G3. Оборотний капітал', 'Поточний оборотний капітал', roundMoney_(workingCapitalTotals.currentWorkingCapital || 0), 'Середній оборотний капітал', roundMoney_(workingCapitalTotals.averageWorkingCapital || 0), 'Зміна до попереднього місяця', roundMoney_(workingCapitalTotals.changeVsPreviousMonth || 0), '']);
+  rows.push(['INFO', 'G3. Оборотний капітал по місяцях', 'Місяць', 'Собівартість товарів на Amazon', 'Кошти доступні на вивід Amazon', 'Товари готові до відправки', 'Кошти на руках', 'Можливість кредитування', 'Оборотний капітал']);
+  for (let wc = 0; wc < (workingCapitalAgg.months || []).length; wc++) {
+    const wcMonth = workingCapitalAgg.months[wc];
+    const wcData = (workingCapitalAgg.byMonth || {})[wcMonth] || {};
+    rows.push(['DATA', 'G3. Оборотний капітал по місяцях', wcMonth, wcData.cogsAmazon || 0, wcData.amazonPayoutAvailable || 0, wcData.goodsReadyToShip || 0, wcData.cashOnHand || 0, wcData.creditCapacity || 0, wcData.workingCapital || 0]);
+  }
+
   const unique = buildSalesTaxUniques_();
   rows.push(['INFO', 'H. Унікальні значення', 'Ставки податку', unique.taxRates.join(', '), '', '', '', '', '']);
   rows.push(['INFO', 'H. Унікальні значення', 'Країни доставки', unique.shipToCountries.join(', '), '', '', '', '', '']);
@@ -5427,7 +5663,7 @@ function writeDiagnostics_() {
   if (legacyStatus.legacyExists && legacyStatus.uniqueLegacyRows > 0) rows.push(['WARN', 'I. Legacy monthly sheet', 'Legacy sheet містить рядки поза main', String(legacyStatus.uniqueLegacyRows), '', '', '', '', '']);
 
   const allWarnings = []
-    .concat(manualVat.warnings || [], manualFees.warnings || [], manualExpenses.warnings || [], manualByFundCategory.warnings || [], manualExpenseVat.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || []);
+    .concat(manualVat.warnings || [], manualFees.warnings || [], manualExpenses.warnings || [], manualByFundCategory.warnings || [], manualExpenseVat.warnings || [], manualValidation.warnings || [], purchasePreview.warnings || [], purchaseSync.errors || [], workingCapitalAgg.warnings || []);
   for (let q = 0; q < allWarnings.length; q++) {
     rows.push(['WARN', 'J. Попередження', allWarnings[q], '', '', '', '', '', '']);
   }
@@ -5619,8 +5855,10 @@ function rebuildDashboard_() {
   });
 
   const manualByCategory = collectManualExpenseCategoryTotalsForDashboard_();
-  renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory);
-  renderDashboardCharts_(dashboard, monthlyRows);
+  const workingCapitalAgg = collectWorkingCapitalByMonth_();
+  const workingCapitalTotals = getWorkingCapitalTotals_(workingCapitalAgg);
+  renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory, workingCapitalAgg, workingCapitalTotals);
+  renderDashboardCharts_(dashboard, monthlyRows, workingCapitalAgg);
   dashboard.autoResizeColumns(1, 8);
   dashboard.setFrozenRows(2);
 
@@ -5761,7 +5999,7 @@ function calculateDashboardFundCategoryBalanceRows_(allocatedByCategory, spentBy
   return out;
 }
 
-function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
+function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapitalAgg, workingCapitalTotals) {
   const totals = rows.reduce(function(acc, row) {
     acc.profitBeforeVat += row.profitBeforeVat;
     acc.vatToPay += row.vatToPay;
@@ -5777,13 +6015,17 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
   sheet.getRange('A1').setValue('ДЕШБОРД AMAZON FBA').setFontWeight('bold').setFontSize(18);
   sheet.getRange('A2').setValue('Оновлено: ' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss'));
 
+  const wcTotals = workingCapitalTotals || { currentWorkingCapital: 0, averageWorkingCapital: 0, changeVsPreviousMonth: 0 };
   const kpiHeaders = [
     'Загальний прибуток (після НДС)',
     'Загальний прибуток до НДС',
     'Загальний НДС до оплати',
     'Вже сплачений НДС (разом)',
     'Залишок після НДС (cash)',
-    'Середній прибуток за місяць'
+    'Середній прибуток за місяць',
+    'Поточний оборотний капітал',
+    'Середній оборотний капітал',
+    'Зміна до попереднього місяця'
   ];
   const kpiValues = [
     totalProfitAfterVat,
@@ -5791,32 +6033,35 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
     roundMoney_(totals.vatToPay),
     roundMoney_(totals.vatPaid),
     roundMoney_(totals.cashAfterVat),
-    avgProfitPerMonth
+    avgProfitPerMonth,
+    roundMoney_(wcTotals.currentWorkingCapital || 0),
+    roundMoney_(wcTotals.averageWorkingCapital || 0),
+    roundMoney_(wcTotals.changeVsPreviousMonth || 0)
   ];
 
   for (let i = 0; i < kpiHeaders.length; i++) {
-    const col = i < 3 ? (1 + i * 2) : (1 + (i - 3) * 2);
-    const row = i < 3 ? 4 : 7;
+    const col = 1 + (i % 3) * 2;
+    const row = 4 + Math.floor(i / 3) * 3;
     sheet.getRange(row, col, 1, 2).merge();
     sheet.getRange(row, col).setValue(kpiHeaders[i]).setFontWeight('bold').setBackground('#e8f0fe');
     sheet.getRange(row + 1, col, 1, 2).merge();
     sheet.getRange(row + 1, col).setValue(kpiValues[i]).setFontSize(16).setFontWeight('bold').setNumberFormat('€#,##0.00');
   }
 
-  sheet.getRange('A11').setValue('Поточний місяць: ' + latest.month).setFontWeight('bold').setFontSize(13);
-  sheet.getRange(12, 1, 1, 4).setValues([['Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#f3f3f3');
-  sheet.getRange(13, 1, 1, 4).setValues([[latest.profitBeforeVat, latest.vatToPay, latest.vatPaid, latest.cashAfterVat]]).setNumberFormat('€#,##0.00').setFontWeight('bold');
+  sheet.getRange('A14').setValue('Поточний місяць: ' + latest.month).setFontWeight('bold').setFontSize(13);
+  sheet.getRange(15, 1, 1, 4).setValues([['Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#f3f3f3');
+  sheet.getRange(16, 1, 1, 4).setValues([[latest.profitBeforeVat, latest.vatToPay, latest.vatPaid, latest.cashAfterVat]]).setNumberFormat('€#,##0.00').setFontWeight('bold');
 
-  sheet.getRange('A15').setValue('Таблиця по місяцях').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(16, 1, 1, 5).setValues([['Місяць', 'Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС (разом)', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#d9ead3');
+  sheet.getRange('A18').setValue('Таблиця по місяцях').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(19, 1, 1, 5).setValues([['Місяць', 'Прибуток до НДС', 'НДС до оплати', 'Вже сплачений НДС (разом)', 'Залишок після НДС']]).setFontWeight('bold').setBackground('#d9ead3');
   const tableRows = rows.map(function(row) {
     return [row.month, row.profitBeforeVat, row.vatToPay, row.vatPaid, row.cashAfterVat];
   });
-  sheet.getRange(17, 1, tableRows.length, 5).setValues(tableRows);
-  sheet.getRange(17, 1, tableRows.length, 1).setNumberFormat('@');
-  sheet.getRange(17, 2, tableRows.length, 4).setNumberFormat('€#,##0.00');
+  sheet.getRange(20, 1, tableRows.length, 5).setValues(tableRows);
+  sheet.getRange(20, 1, tableRows.length, 1).setNumberFormat('@');
+  sheet.getRange(20, 2, tableRows.length, 4).setNumberFormat('€#,##0.00');
 
-  const combinedHeaderRow = 17 + tableRows.length + 2;
+  const combinedHeaderRow = 20 + tableRows.length + 2;
   sheet.getRange(combinedHeaderRow, 1).setValue('Фінансовий розподіл по категоріях').setFontWeight('bold').setFontSize(13);
   sheet.getRange(combinedHeaderRow + 1, 1, 1, 4)
     .setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']])
@@ -5842,7 +6087,56 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
     }
   }
 
-  const vatStatusRow = combinedHeaderRow + 2 + renderedCategoryRows.length + 2;
+  const workingCapitalRows = (workingCapitalAgg && workingCapitalAgg.rows) ? workingCapitalAgg.rows.slice() : [];
+  const wcStartRow = combinedHeaderRow + 2 + renderedCategoryRows.length + 2;
+  sheet.getRange(wcStartRow, 1).setValue('Оборотний капітал по місяцях').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(wcStartRow + 1, 1, 1, 7).setValues([[
+    'Місяць',
+    'Собівартість товарів на Amazon',
+    'Кошти доступні на вивід Amazon',
+    'Товари готові до відправки',
+    'Кошти на руках',
+    'Можливість кредитування',
+    'Оборотний капітал'
+  ]]).setFontWeight('bold').setBackground('#cfe2f3');
+
+  if (workingCapitalRows.length) {
+    const wcTable = workingCapitalRows.map(function(row) {
+      return [
+        row.month,
+        row.cogsAmazon,
+        row.amazonPayoutAvailable,
+        row.goodsReadyToShip,
+        row.cashOnHand,
+        row.creditCapacity,
+        row.workingCapital
+      ];
+    });
+    sheet.getRange(wcStartRow + 2, 1, wcTable.length, 7).setValues(wcTable);
+    sheet.getRange(wcStartRow + 2, 1, wcTable.length, 1).setNumberFormat('@');
+    sheet.getRange(wcStartRow + 2, 2, wcTable.length, 6).setNumberFormat('€#,##0.00');
+  } else {
+    sheet.getRange(wcStartRow + 2, 1).setValue('Немає активних даних у листі ' + getWorkingCapitalSheetName_() + '.').setFontColor('#777777');
+  }
+
+  const latestWc = wcTotals.latestBreakdown;
+  const wcStructureRow = wcStartRow + 2 + Math.max(workingCapitalRows.length, 1) + 2;
+  sheet.getRange(wcStructureRow, 1).setValue('Поточна структура оборотного капіталу' + (wcTotals.latestMonth ? ' (' + wcTotals.latestMonth + ')' : '')).setFontWeight('bold').setFontSize(13);
+  sheet.getRange(wcStructureRow + 1, 1, 1, 2).setValues([['Складова', 'Сума']]).setFontWeight('bold').setBackground('#d9d2e9');
+
+  const wcBreakdownRows = [
+    ['Собівартість товарів на Amazon', latestWc ? latestWc.cogsAmazon : 0],
+    ['Кошти доступні на вивід Amazon', latestWc ? latestWc.amazonPayoutAvailable : 0],
+    ['Товари готові до відправки', latestWc ? latestWc.goodsReadyToShip : 0],
+    ['Кошти на руках', latestWc ? latestWc.cashOnHand : 0],
+    ['Можливість кредитування', latestWc ? latestWc.creditCapacity : 0],
+    ['Разом оборотний капітал', roundMoney_(wcTotals.currentWorkingCapital || 0)]
+  ];
+  sheet.getRange(wcStructureRow + 2, 1, wcBreakdownRows.length, 2).setValues(wcBreakdownRows);
+  sheet.getRange(wcStructureRow + 2, 2, wcBreakdownRows.length, 1).setNumberFormat('€#,##0.00');
+  sheet.getRange(wcStructureRow + 2 + wcBreakdownRows.length - 1, 1, 1, 2).setFontWeight('bold').setBackground('#fff2cc');
+
+  const vatStatusRow = wcStructureRow + 2 + wcBreakdownRows.length + 2;
   const vatDiff = roundMoney_(totals.vatToPay - totals.vatPaid);
   sheet.getRange(vatStatusRow, 1).setValue('Статус НДС').setFontWeight('bold').setFontSize(13);
   sheet.getRange(vatStatusRow + 1, 1, 1, 3).setValues([['НДС до сплати', 'Вже сплачено', 'Різниця']]).setFontWeight('bold').setBackground('#fce5cd');
@@ -5853,9 +6147,9 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg) {
   else statusCell.setBackground('#d9ead3').setFontColor('#1b5e20');
 }
 
-function renderDashboardCharts_(sheet, rows) {
+function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
   if (!rows.length) return;
-  const firstDataRow = 17;
+  const firstDataRow = 20;
   const rowCount = rows.length;
 
   const profitChart = sheet.newChart()
@@ -5863,7 +6157,7 @@ function renderDashboardCharts_(sheet, rows) {
     .addRange(sheet.getRange(firstDataRow, 1, rowCount, 2))
     .setOption('title', 'Тренд прибутку по місяцях')
     .setOption('legend', { position: 'bottom' })
-    .setPosition(4, 8, 0, 0)
+    .setPosition(4, 9, 0, 0)
     .build();
   sheet.insertChart(profitChart);
 
@@ -5872,7 +6166,29 @@ function renderDashboardCharts_(sheet, rows) {
     .addRange(sheet.getRange(firstDataRow, 1, rowCount, 3))
     .setOption('title', 'Тренд НДС по місяцях')
     .setOption('legend', { position: 'bottom' })
-    .setPosition(20, 8, 0, 0)
+    .setPosition(20, 9, 0, 0)
     .build();
   sheet.insertChart(vatChart);
+
+  const wcRows = (workingCapitalAgg && workingCapitalAgg.rows) ? workingCapitalAgg.rows : [];
+  if (wcRows.length) {
+    const startRow = Math.max(1, sheet.getLastRow() + 2);
+    sheet.getRange(startRow, 11, 1, 2).setValues([['Місяць', 'Оборотний капітал']]);
+    const wcChartRows = wcRows.map(function(row) { return [row.month, row.workingCapital]; });
+    sheet.getRange(startRow + 1, 11, wcChartRows.length, 2).setValues(wcChartRows);
+    sheet.getRange(startRow + 1, 11, wcChartRows.length, 1).setNumberFormat('@');
+    sheet.getRange(startRow + 1, 12, wcChartRows.length, 1).setNumberFormat('€#,##0.00');
+
+    const workingCapitalChart = sheet.newChart()
+      .asLineChart()
+      .addRange(sheet.getRange(startRow, 11, wcChartRows.length + 1, 2))
+      .setOption('title', 'Тенденція оборотного капіталу')
+      .setOption('legend', { position: 'none' })
+      .setOption('hAxis', { title: 'Місяць' })
+      .setOption('vAxis', { title: 'Оборотний капітал' })
+      .setPosition(36, 9, 0, 0)
+      .build();
+    sheet.insertChart(workingCapitalChart);
+  }
 }
+
