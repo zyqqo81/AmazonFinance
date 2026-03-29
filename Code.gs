@@ -4260,7 +4260,6 @@ function menuEnsureManualFeesSheet_() {
 function menuRebuildMonthlyReport_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualExpensesSheet_();
     const res = rebuildMonthlyVatPayoutSummary_();
     ui.alert(['Місячний звіт перераховано.', 'Місяців: ' + res.months, 'Сума виплат Amazon: ' + res.totalPayout.toFixed(2)].join('\n'));
   } catch (e) {
@@ -4271,7 +4270,6 @@ function menuRebuildMonthlyReport_() {
 function menuRebuildLatestMonthOnly_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualExpensesSheet_();
     const res = rebuildLatestMonthOnly_();
     ui.alert(['Останній місяць перераховано.', 'Місяць: ' + res.month, 'Виплата: ' + res.paidOut.toFixed(2), 'НДС до оплати: ' + res.vatToPay.toFixed(2)].join('\n'));
   } catch (e) {
@@ -4296,7 +4294,6 @@ function menuRebuildDashboard_() {
 function menuRunDiagnostics_() {
   const ui = SpreadsheetApp.getUi();
   try {
-    ensureManualExpensesSheet_();
     const res = runVatDiagnostics_();
     ui.alert('Діагностику оновлено. Рядків: ' + res.rows);
   } catch (e) {
@@ -4820,16 +4817,21 @@ function normalizeManualOperationRow_(row, headerMap, rowNumber) {
   return normalizeManualExpenseRow_(row, headerMap, rowNumber);
 }
 
-function getManualExpensesData_() {
-  ensureManualExpensesSheet_();
+function getManualExpenseSheetHeaderMap_() {
   const sh = SpreadsheetApp.getActive().getSheetByName(getManualExpensesSheetName_());
+  if (!sh) return { sheet: null, headerMap: {} };
+  return { sheet: sh, headerMap: getHeaderMap_(sh) };
+}
+
+function readManualExpensesRowsReadOnly_() {
+  const sheetInfo = getManualExpenseSheetHeaderMap_();
+  const sh = sheetInfo.sheet;
+  const hm = sheetInfo.headerMap;
   const headers = getManualExpensesHeaders_();
-  const hm = getHeaderMap_(sh);
   if (!sh || sh.getLastRow() < 2) return { sheet: sh, headerMap: hm, rows: [] };
 
   const width = Math.max(sh.getLastColumn(), headers.length);
   const all = sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues();
-  const normalizedRows = [];
   const objects = [];
   for (let i = 0; i < all.length; i++) {
     const normalized = normalizeManualExpenseRow_(all[i], hm, i + 2);
@@ -4845,14 +4847,14 @@ function getManualExpensesData_() {
     obj.__effectiveAmount = obj.__netAmount || obj.__grossAmount || 0;
     obj.__fundCategory = normalizeManualExpenseFundCategory_(obj['Категорія коштів']);
     obj.__hasKnownFundCategory = isKnownManualExpenseFundCategory_(obj.__fundCategory);
-    normalizedRows.push(normalized.row);
     objects.push(obj);
   }
 
-  if (normalizedRows.length) {
-    sh.getRange(2, 1, normalizedRows.length, headers.length).setValues(normalizedRows);
-  }
   return { sheet: sh, headerMap: hm, rows: objects };
+}
+
+function getManualExpensesData_() {
+  return readManualExpensesRowsReadOnly_();
 }
 
 function getManualOperationsData_() {
@@ -4896,7 +4898,7 @@ function readManualExpensesRowsForDashboard_() {
   return out;
 }
 
-function collectManualExpenseCategoryTotalsForDashboard_() {
+function collectManualExpenseCategoryTotalsReadOnly_() {
   const rows = readManualExpensesRowsForDashboard_();
   const totalsByCategory = buildManualExpenseFundCategoryTotalsSkeleton_();
   const byMonth = {};
@@ -4930,6 +4932,11 @@ function collectManualExpenseCategoryTotalsForDashboard_() {
 
   return { byMonth: byMonth, totalsByCategory: totalsByCategory, warnings: warnings };
 }
+
+function collectManualExpenseCategoryTotalsForDashboard_() {
+  return collectManualExpenseCategoryTotalsReadOnly_();
+}
+
 
 function validateManualExpenseRows_() {
   const data = getManualExpensesData_();
@@ -5102,10 +5109,10 @@ function collectManualOperationsByMonth_() {
 }
 
 function validateManualExpenseVatRows_() {
-  return collectManualExpenseVatByMonth_().stats;
+  return collectManualExpenseVatByMonthReadOnly_().stats;
 }
 
-function collectManualExpenseVatByMonth_() {
+function collectManualExpenseVatByMonthReadOnly_() {
   const data = getManualExpensesData_();
   const out = {};
   const warnings = [];
@@ -5149,6 +5156,11 @@ function collectManualExpenseVatByMonth_() {
 
   return { byMonth: out, warnings: warnings, stats: stats };
 }
+
+function collectManualExpenseVatByMonth_() {
+  return collectManualExpenseVatByMonthReadOnly_();
+}
+
 
 function getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth) {
   return roundMoney_(((manualExpenseVatByMonth || {})[month] || { vat: 0 }).vat || 0);
@@ -5362,7 +5374,6 @@ function readManualFeesByMonth_() {
 }
 
 function rebuildLatestMonthOnly_() {
-  ensureManualExpensesSheet_();
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFees = buildSettlementFeesByMonth_();
@@ -5370,7 +5381,7 @@ function rebuildLatestMonthOnly_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const manualExpenseVat = collectManualExpenseVatByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
@@ -5392,7 +5403,6 @@ function rebuildLatestMonthOnly_() {
 }
 
 function rebuildMonthlyVatPayoutSummary_() {
-  ensureManualExpensesSheet_();
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFees = buildSettlementFeesByMonth_();
@@ -5400,7 +5410,7 @@ function rebuildMonthlyVatPayoutSummary_() {
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
-  const manualExpenseVat = collectManualExpenseVatByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
@@ -5591,7 +5601,7 @@ function writeDiagnostics_() {
   const manualFees = readManualFeesByMonth_();
   const manualExpenses = collectManualExpensesByMonth_();
   const manualByFundCategory = collectManualExpensesByFundCategoryByMonth_();
-  const manualExpenseVat = collectManualExpenseVatByMonth_();
+  const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
   const manualValidation = validateManualExpenseRows_();
   const manualVatValidation = validateManualExpenseVatRows_();
   const purchasePreview = collectPurchaseRowsForSync_();
@@ -5915,7 +5925,7 @@ function rebuildDashboard_() {
     return 0;
   });
 
-  const manualByCategory = collectManualExpenseCategoryTotalsForDashboard_();
+  const manualByCategory = collectManualExpenseCategoryTotalsReadOnly_();
   const workingCapitalAgg = collectWorkingCapitalByMonth_();
   const workingCapitalTotals = getWorkingCapitalTotals_(workingCapitalAgg);
   renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory, workingCapitalAgg, workingCapitalTotals);
