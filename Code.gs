@@ -4340,20 +4340,19 @@ function getManualExpensesHeaders_() {
     'Дата',
     'Місяць',
     'Категорія',
-    'Категорія коштів',
-    'Опис',
-    'Постачальник',
     'Тип документа',
-    'Номер документа',
     'Сума без НДС',
     'Сума НДС',
     'Сума з НДС',
-    'Валюта',
-    'Спосіб оплати',
+    'Опис',
     'Враховувати у прибутку',
     'Активно',
-    'Примітки'
+    'Категорія коштів'
   ];
+}
+
+function getManualExpensesReadOnlyHeaders_() {
+  return getManualExpensesHeaders_().slice();
 }
 
 function getManualOperationsHeaders_() {
@@ -4364,66 +4363,11 @@ function ensureManualExpensesSheet_() {
   const ss = SpreadsheetApp.getActive();
   let sh = ss.getSheetByName(getManualExpensesSheetName_());
   const created = !sh;
-  if (!sh) sh = ss.insertSheet(getManualExpensesSheetName_());
-
+  if (sh) return { sheetName: getManualExpensesSheetName_(), created: false, addedHeaders: 0, readOnlyProtected: true };
+  sh = ss.insertSheet(getManualExpensesSheetName_());
   const headers = getManualExpensesHeaders_();
-  let addedHeaders = 0;
-  const maxCols = Math.max(sh.getLastColumn() || 1, headers.length);
-  const row1 = sh.getRange(1, 1, 1, maxCols).getValues()[0].map(function(v) { return String(v || '').trim(); });
-
-  if (sh.getLastRow() === 0 || row1.join('') === '') {
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-    addedHeaders = headers.length;
-  } else {
-    let appendAt = sh.getLastColumn();
-    for (let i = 0; i < headers.length; i++) {
-      if (row1.indexOf(headers[i]) === -1) {
-        appendAt += 1;
-        sh.getRange(1, appendAt).setValue(headers[i]);
-        addedHeaders += 1;
-      }
-    }
-  }
-
-  const hm = getHeaderMap_(sh);
-  const dataRows = Math.max(1, sh.getMaxRows() - 1);
-  if (hm['Тип витрати']) {
-    const typeRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(getManualExpenseTypes_(), true)
-      .setAllowInvalid(true)
-      .build();
-    sh.getRange(2, hm['Тип витрати'], dataRows, 1).setDataValidation(typeRule);
-  }
-  if (hm['Тип документа']) {
-    const docRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(getManualExpenseDocumentTypes_(), true)
-      .setAllowInvalid(true)
-      .build();
-    sh.getRange(2, hm['Тип документа'], dataRows, 1).setDataValidation(docRule);
-  }
-  if (hm['Спосіб оплати']) {
-    const paymentRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(getManualExpensePaymentMethods_(), true)
-      .setAllowInvalid(true)
-      .build();
-    sh.getRange(2, hm['Спосіб оплати'], dataRows, 1).setDataValidation(paymentRule);
-  }
-  if (hm['Категорія коштів']) {
-    const fundCategoryRule = SpreadsheetApp.newDataValidation()
-      .requireValueInList(getManualExpenseFundCategories_(), true)
-      .setAllowInvalid(true)
-      .build();
-    sh.getRange(2, hm['Категорія коштів'], dataRows, 1).setDataValidation(fundCategoryRule);
-  }
-  if (hm['Враховувати у прибутку']) sh.getRange(2, hm['Враховувати у прибутку'], dataRows, 1).insertCheckboxes();
-  if (hm['Активно']) sh.getRange(2, hm['Активно'], dataRows, 1).insertCheckboxes();
-  if (hm['Дата']) safeSetNumberFormat_(sh.getRange(2, hm['Дата'], dataRows, 1), 'yyyy-mm-dd', [], 'manualExpenses.date');
-  if (hm['Місяць']) safeSetNumberFormat_(sh.getRange(2, hm['Місяць'], dataRows, 1), '@', [], 'manualExpenses.month');
-  ['Сума без НДС', 'Сума НДС', 'Сума з НДС'].forEach(function(header) {
-    if (hm[header]) safeSetNumberFormat_(sh.getRange(2, hm[header], dataRows, 1), '#,##0.00', [], 'manualExpenses.' + header);
-  });
-
-  return { sheetName: getManualExpensesSheetName_(), created: created, addedHeaders: addedHeaders };
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  return { sheetName: getManualExpensesSheetName_(), created: created, addedHeaders: headers.length, readOnlyProtected: true };
 }
 
 function ensureManualOperationsSheet_() {
@@ -4772,7 +4716,7 @@ function deriveManualExpenseMonthKey_(value) {
 }
 
 function normalizeManualExpenseRow_(row, headerMap, rowNumber) {
-  const headers = getManualExpensesHeaders_();
+  const headers = getManualExpensesReadOnlyHeaders_();
   const out = headers.map(function(header) {
     const col = headerMap[header];
     return col ? row[col - 1] : '';
@@ -4780,15 +4724,18 @@ function normalizeManualExpenseRow_(row, headerMap, rowNumber) {
   const warnings = [];
 
   function idx(header) { return headers.indexOf(header); }
-  function get(header) { return out[idx(header)]; }
-  function set(header, value) { out[idx(header)] = value; }
-
-  if (!String(get('ID') || '').trim()) set('ID', 'RV-' + Utilities.getUuid());
+  function get(header) {
+    const index = idx(header);
+    return index === -1 ? '' : out[index];
+  }
+  function set(header, value) {
+    const index = idx(header);
+    if (index !== -1) out[index] = value;
+  }
 
   const originalDate = get('Дата');
   const parsedDate = parseDateFlexible_(originalDate, CONFIG.TZ, {});
   if (parsedDate instanceof Date && !isNaN(parsedDate.getTime())) {
-    set('Дата', parsedDate);
     set('Місяць', Utilities.formatDate(parsedDate, CONFIG.TZ, 'yyyy-MM'));
   } else {
     const monthKey = deriveManualExpenseMonthKey_(get('Місяць'));
@@ -4796,7 +4743,6 @@ function normalizeManualExpenseRow_(row, headerMap, rowNumber) {
     if (String(originalDate || '').trim() !== '') warnings.push('Рядок ' + rowNumber + ': невалідна дата.');
   }
 
-  if (!String(get('Валюта') || '').trim()) set('Валюта', CONFIG.CURRENCY || 'EUR');
   if (get('Активно') === '' || get('Активно') === null) set('Активно', true);
   set('Тип витрати', normalizeManualExpenseType_(get('Тип витрати')));
   set('Категорія коштів', normalizeManualExpenseFundCategory_(get('Категорія коштів')));
@@ -4818,22 +4764,35 @@ function normalizeManualOperationRow_(row, headerMap, rowNumber) {
 }
 
 function getManualExpenseSheetHeaderMap_() {
+  return getManualExpensesHeaderMapReadOnly_();
+}
+
+function getManualExpensesHeaderMapReadOnly_() {
   const sh = SpreadsheetApp.getActive().getSheetByName(getManualExpensesSheetName_());
   if (!sh) return { sheet: null, headerMap: {} };
-  return { sheet: sh, headerMap: getHeaderMap_(sh) };
+  const width = sh.getLastColumn();
+  if (width < 1) return { sheet: sh, headerMap: {} };
+  const headerRow = sh.getRange(1, 1, 1, width).getValues()[0];
+  const headerMap = {};
+  for (let i = 0; i < headerRow.length; i++) {
+    const header = String(headerRow[i] || '').trim();
+    if (header && headerMap[header] === undefined) headerMap[header] = i + 1;
+  }
+  return { sheet: sh, headerMap: headerMap };
 }
 
 function readManualExpensesRowsReadOnly_() {
-  const sheetInfo = getManualExpenseSheetHeaderMap_();
+  const sheetInfo = getManualExpensesHeaderMapReadOnly_();
   const sh = sheetInfo.sheet;
   const hm = sheetInfo.headerMap;
-  const headers = getManualExpensesHeaders_();
+  const headers = getManualExpensesReadOnlyHeaders_();
   if (!sh || sh.getLastRow() < 2) return { sheet: sh, headerMap: hm, rows: [] };
 
-  const width = Math.max(sh.getLastColumn(), headers.length);
+  const width = sh.getLastColumn();
   const all = sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues();
   const objects = [];
   for (let i = 0; i < all.length; i++) {
+    if (isEmptyRow_(all[i])) continue;
     const normalized = normalizeManualExpenseRow_(all[i], hm, i + 2);
     const obj = rowArrayToObject_(normalized.row, headers);
     obj.__rowNumber = i + 2;
@@ -4862,40 +4821,7 @@ function getManualOperationsData_() {
 }
 
 function readManualExpensesRowsForDashboard_() {
-  const sh = SpreadsheetApp.getActive().getSheetByName(getManualExpensesSheetName_());
-  const headers = getManualExpensesHeaders_();
-  if (!sh || sh.getLastRow() < 2 || sh.getLastColumn() < 1) return [];
-
-  const width = sh.getLastColumn();
-  const values = sh.getRange(1, 1, sh.getLastRow(), width).getValues();
-  const headerRow = values[0].map(function(v) { return String(v || '').trim(); });
-  const headerMap = {};
-  for (let i = 0; i < headerRow.length; i++) {
-    if (headerRow[i]) headerMap[headerRow[i]] = i;
-  }
-
-  const out = [];
-  for (let r = 1; r < values.length; r++) {
-    const sourceRow = values[r];
-    const rowObj = {};
-    for (let h = 0; h < headers.length; h++) {
-      const header = headers[h];
-      const idx = headerMap[header];
-      rowObj[header] = idx === undefined ? '' : sourceRow[idx];
-    }
-    rowObj.__rowNumber = r + 1;
-    rowObj.__active = isManualOperationActive_(rowObj['Активно']);
-    rowObj.__month = deriveManualExpenseMonthKey_(rowObj['Місяць']) || deriveManualExpenseMonthKey_(rowObj['Дата']) || '';
-    rowObj.__netAmount = parseNumberFlexible_(rowObj['Сума без НДС']);
-    rowObj.__vatAmount = parseNumberFlexible_(rowObj['Сума НДС']);
-    rowObj.__grossAmount = parseNumberFlexible_(rowObj['Сума з НДС']);
-    rowObj.__effectiveAmount = rowObj.__netAmount || rowObj.__grossAmount || 0;
-    rowObj.__fundCategory = normalizeManualExpenseFundCategory_(rowObj['Категорія коштів']);
-    rowObj.__hasKnownFundCategory = isKnownManualExpenseFundCategory_(rowObj.__fundCategory);
-    out.push(rowObj);
-  }
-
-  return out;
+  return readManualExpensesRowsReadOnly_().rows;
 }
 
 function collectManualExpenseCategoryTotalsReadOnly_() {
