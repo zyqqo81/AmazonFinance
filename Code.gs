@@ -6049,38 +6049,15 @@ function calculateDashboardProfitDistributionRows_(allocatedByCategory) {
   return out;
 }
 
-function calculateDashboardReinvestFundRows_(totals, allocatedByCategory, spentByCategory, latest) {
+function calculateDashboardOperationalFundRows_(totals, allocatedByCategory, spentByCategory) {
+  const out = [];
   const cogsReturnTotal = roundMoney_((totals && totals.cogs) || 0);
   const reinvestFromProfitTotal = roundMoney_((allocatedByCategory || {})['Реінвест (75%)'] || 0);
-  const fullFundTotal = roundMoney_(cogsReturnTotal + reinvestFromProfitTotal);
-  const spentReinvestTotal = roundMoney_((spentByCategory || {})['Реінвест (75%)'] || 0);
-  const remainingTotal = roundMoney_(fullFundTotal - spentReinvestTotal);
+  const reinvestAllocated = roundMoney_(cogsReturnTotal + reinvestFromProfitTotal);
+  const reinvestSpent = roundMoney_((spentByCategory || {})['Реінвест (75%)'] || 0);
+  out.push(['Реінвест', reinvestAllocated, reinvestSpent, roundMoney_(reinvestAllocated - reinvestSpent)]);
 
-  const latestRow = latest || {};
-  const latestCashAfterVat = roundMoney_(latestRow.cashAfterVat || 0);
-  const latestCogs = roundMoney_(latestRow.cogs || 0);
-  const latestReinvestFromProfit = roundMoney_(latestCashAfterVat * 0.75);
-  const latestFullFund = roundMoney_(latestCogs + latestReinvestFromProfit);
-  const latestSpentReinvest = roundMoney_((latestRow.manualSpentReinvest || 0));
-  const latestRemaining = roundMoney_(latestFullFund - latestSpentReinvest);
-
-  return [
-    ['Собівартість до повернення (весь період)', cogsReturnTotal],
-    ['Реінвест із прибутку (весь період)', reinvestFromProfitTotal],
-    ['Повний фонд реінвесту (весь період)', fullFundTotal],
-    ['Фактично витрачено з фонду реінвесту (весь період)', spentReinvestTotal],
-    ['Залишок фонду реінвесту (весь період)', remainingTotal],
-    ['Собівартість до повернення (останній місяць)', latestCogs],
-    ['Реінвест із прибутку (останній місяць)', latestReinvestFromProfit],
-    ['Повний фонд реінвесту (останній місяць)', latestFullFund],
-    ['Фактично витрачено з фонду реінвесту (останній місяць)', latestSpentReinvest],
-    ['Залишок фонду реінвесту (останній місяць)', latestRemaining]
-  ];
-}
-
-function calculateDashboardProfitBucketExpenseRows_(allocatedByCategory, spentByCategory) {
   const categories = getDashboardProfitOnlyCategories_();
-  const out = [];
   for (let i = 0; i < categories.length; i++) {
     const category = categories[i];
     const allocated = roundMoney_((allocatedByCategory || {})[category] || 0);
@@ -6088,23 +6065,14 @@ function calculateDashboardProfitBucketExpenseRows_(allocatedByCategory, spentBy
     const remaining = roundMoney_(allocated - spent);
     out.push([category, allocated, spent, remaining]);
   }
+
   return out;
 }
 
-function getDashboardReinvestNegativeRows_(reinvestFundRows) {
-  const negativeRows = [];
-  for (let i = 0; i < reinvestFundRows.length; i++) {
-    const label = String(reinvestFundRows[i][0] || '');
-    const value = roundMoney_(reinvestFundRows[i][1] || 0);
-    if (label.indexOf('Залишок фонду реінвесту') !== -1 && value < 0) negativeRows.push(i);
-  }
-  return negativeRows;
-}
-
-function getDashboardProfitBucketNegativeRows_(profitBucketRows) {
+function getDashboardOperationalFundNegativeRows_(fundRows) {
   const out = [];
-  for (let i = 0; i < profitBucketRows.length; i++) {
-    if (roundMoney_(profitBucketRows[i][3] || 0) < 0) out.push(i);
+  for (let i = 0; i < fundRows.length; i++) {
+    if (roundMoney_(fundRows[i][3] || 0) < 0) out.push(i);
   }
   return out;
 }
@@ -6225,11 +6193,6 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   cursor += vatReserveRows.length + 3;
   const allocatedByCategory = calculateDashboardFundAllocatedByCategory_(roundMoney_(totals.cashAfterVat));
   const spentByCategory = aggregateManualExpensesForDashboardByCategory_(manualByCategoryAgg);
-  const latestMonthSpentByCategory = (manualByCategoryAgg && manualByCategoryAgg.byMonth && manualByCategoryAgg.byMonth[latest.month] && manualByCategoryAgg.byMonth[latest.month].categories)
-    ? manualByCategoryAgg.byMonth[latest.month].categories
-    : buildManualExpenseFundCategoryTotalsSkeleton_();
-  latest.manualSpentReinvest = roundMoney_(latestMonthSpentByCategory['Реінвест (75%)'] || 0);
-
   sheet.getRange(cursor, 1).setValue('РОЗПОДІЛ ЧИСТОГО ПРИБУТКУ').setFontWeight('bold').setFontSize(13);
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Категорія', 'Виділено з прибутку']]).setFontWeight('bold').setBackground('#fff2cc');
   const profitDistributionRows = calculateDashboardProfitDistributionRows_(allocatedByCategory);
@@ -6237,28 +6200,18 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   sheet.getRange(cursor + 2, 2, profitDistributionRows.length, 1).setNumberFormat('€#,##0.00');
 
   cursor += profitDistributionRows.length + 3;
-  sheet.getRange(cursor, 1).setValue('ФОНД РЕІНВЕСТУ').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#d9ead3');
-  const reinvestFundRows = calculateDashboardReinvestFundRows_(totals, allocatedByCategory, spentByCategory, latest);
-  sheet.getRange(cursor + 2, 1, reinvestFundRows.length, 2).setValues(reinvestFundRows);
-  sheet.getRange(cursor + 2, 2, reinvestFundRows.length, 1).setNumberFormat('€#,##0.00');
-  const reinvestNegativeRows = getDashboardReinvestNegativeRows_(reinvestFundRows);
-  for (let i = 0; i < reinvestNegativeRows.length; i++) {
-    sheet.getRange(cursor + 2 + reinvestNegativeRows[i], 2).setBackground('#f4cccc').setFontColor('#b71c1c').setFontWeight('bold');
+  sheet.getRange(cursor, 1).setValue('ФОНДИ КОШТІВ').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(cursor + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']]).setFontWeight('bold').setBackground('#d9ead3');
+  const operationalFundRows = calculateDashboardOperationalFundRows_(totals, allocatedByCategory, spentByCategory);
+  sheet.getRange(cursor + 2, 1, operationalFundRows.length, 4).setValues(operationalFundRows);
+  sheet.getRange(cursor + 2, 2, operationalFundRows.length, 3).setNumberFormat('€#,##0.00');
+  sheet.getRange(cursor + 2, 1).setNote('Виділено = Собівартість до повернення + Реінвест із прибутку.');
+  const operationalNegativeRows = getDashboardOperationalFundNegativeRows_(operationalFundRows);
+  for (let i = 0; i < operationalNegativeRows.length; i++) {
+    sheet.getRange(cursor + 2 + operationalNegativeRows[i], 4).setBackground('#f4cccc').setFontColor('#b71c1c').setFontWeight('bold');
   }
 
-  cursor += reinvestFundRows.length + 3;
-  sheet.getRange(cursor, 1).setValue('ПРИБУТКОВІ ФОНДИ (БЕЗ РЕІНВЕСТУ)').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(cursor + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']]).setFontWeight('bold').setBackground('#fce5cd');
-  const profitBucketRows = calculateDashboardProfitBucketExpenseRows_(allocatedByCategory, spentByCategory);
-  sheet.getRange(cursor + 2, 1, profitBucketRows.length, 4).setValues(profitBucketRows);
-  sheet.getRange(cursor + 2, 2, profitBucketRows.length, 3).setNumberFormat('€#,##0.00');
-  const profitBucketNegativeRows = getDashboardProfitBucketNegativeRows_(profitBucketRows);
-  for (let i = 0; i < profitBucketNegativeRows.length; i++) {
-    sheet.getRange(cursor + 2 + profitBucketNegativeRows[i], 4).setBackground('#f4cccc').setFontColor('#b71c1c').setFontWeight('bold');
-  }
-
-  cursor += profitBucketRows.length + 3;
+  cursor += operationalFundRows.length + 3;
   sheet.getRange(cursor, 1).setValue('КЕШФЛОУ ПО МІСЯЦЯХ').setFontWeight('bold').setFontSize(13);
   sheet.getRange(cursor + 1, 1, 1, 7).setValues([['Місяць', 'Виплата Amazon', 'Повернення собівартості', 'Прибуток до НДС', 'НДС до оплати', 'Чистий прибуток після НДС', 'Реально вільний кеш']]).setFontWeight('bold').setBackground('#cfe2f3');
   const monthRows = rows.map(function(row) {
