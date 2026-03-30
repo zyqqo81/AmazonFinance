@@ -6030,20 +6030,49 @@ function aggregateManualExpensesForDashboardByCategory_(manualByCategoryAgg) {
   return out;
 }
 
-function calculateDashboardFundCategoryBalanceRows_(allocatedByCategory, spentByCategory) {
-  const categories = getManualExpenseFundCategories_();
+function getDashboardProfitOnlyCategories_() {
+  return [
+    'Бізнес витрати (12%)',
+    'Зарплата (7%)',
+    'Інше (6%)'
+  ];
+}
+
+function calculateDashboardProfitDistributionRows_(allocatedByCategory) {
+  const rules = getDashboardFundAllocationRules_();
+  const out = [];
+  for (let i = 0; i < rules.length; i++) {
+    const category = rules[i].category;
+    const label = category === 'Реінвест (75%)' ? 'Реінвест із прибутку (75%)' : category;
+    out.push([label, roundMoney_((allocatedByCategory || {})[category] || 0)]);
+  }
+  return out;
+}
+
+function calculateDashboardProcurementBudgetRows_(totals, allocatedByCategory, spentByCategory) {
+  const cogsReturn = roundMoney_((totals && totals.cogs) || 0);
+  const reinvestFromProfit = roundMoney_((allocatedByCategory || {})['Реінвест (75%)'] || 0);
+  const totalBudget = roundMoney_(cogsReturn + reinvestFromProfit);
+  const spentReinvest = roundMoney_((spentByCategory || {})['Реінвест (75%)'] || 0);
+  const remainingBudget = roundMoney_(totalBudget - spentReinvest);
+  return [
+    ['Повернення собівартості', cogsReturn],
+    ['Реінвест із прибутку', reinvestFromProfit],
+    ['Повний бюджет на закупку', totalBudget],
+    ['Фактично витрачено на реінвест', spentReinvest],
+    ['Залишок бюджету на закупку', remainingBudget]
+  ];
+}
+
+function calculateDashboardProfitBucketExpenseRows_(allocatedByCategory, spentByCategory) {
+  const categories = getDashboardProfitOnlyCategories_();
   const out = [];
   for (let i = 0; i < categories.length; i++) {
     const category = categories[i];
     const allocated = roundMoney_((allocatedByCategory || {})[category] || 0);
     const spent = roundMoney_((spentByCategory || {})[category] || 0);
     const remaining = roundMoney_(allocated - spent);
-    out.push({
-      category: category,
-      allocated: allocated,
-      spent: spent,
-      remaining: remaining
-    });
+    out.push([category, allocated, spent, remaining]);
   }
   return out;
 }
@@ -6162,17 +6191,30 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   else vatRiskCell.setBackground('#d9ead3').setFontColor('#1b5e20').setFontWeight('bold');
 
   cursor += vatReserveRows.length + 3;
-  sheet.getRange(cursor, 1).setValue('Фінансовий розподіл по категоріях').setFontWeight('bold').setFontSize(13);
-  sheet.getRange(cursor + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']]).setFontWeight('bold').setBackground('#fff2cc');
   const allocatedByCategory = calculateDashboardFundAllocatedByCategory_(roundMoney_(totals.cashAfterVat));
   const spentByCategory = aggregateManualExpensesForDashboardByCategory_(manualByCategoryAgg);
-  const renderedCategoryRows = calculateDashboardFundCategoryBalanceRows_(allocatedByCategory, spentByCategory).map(function(item) {
-    return [item.category, item.allocated, item.spent, item.remaining];
-  });
-  sheet.getRange(cursor + 2, 1, renderedCategoryRows.length, 4).setValues(renderedCategoryRows);
-  sheet.getRange(cursor + 2, 2, renderedCategoryRows.length, 3).setNumberFormat('€#,##0.00');
 
-  cursor += renderedCategoryRows.length + 3;
+  sheet.getRange(cursor, 1).setValue('РОЗПОДІЛ ЧИСТОГО ПРИБУТКУ').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Категорія', 'Виділено з прибутку']]).setFontWeight('bold').setBackground('#fff2cc');
+  const profitDistributionRows = calculateDashboardProfitDistributionRows_(allocatedByCategory);
+  sheet.getRange(cursor + 2, 1, profitDistributionRows.length, 2).setValues(profitDistributionRows);
+  sheet.getRange(cursor + 2, 2, profitDistributionRows.length, 1).setNumberFormat('€#,##0.00');
+
+  cursor += profitDistributionRows.length + 3;
+  sheet.getRange(cursor, 1).setValue('БЮДЖЕТ НА ЗАКУПКУ ТОВАРУ').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#d9ead3');
+  const procurementBudgetRows = calculateDashboardProcurementBudgetRows_(totals, allocatedByCategory, spentByCategory);
+  sheet.getRange(cursor + 2, 1, procurementBudgetRows.length, 2).setValues(procurementBudgetRows);
+  sheet.getRange(cursor + 2, 2, procurementBudgetRows.length, 1).setNumberFormat('€#,##0.00');
+
+  cursor += procurementBudgetRows.length + 3;
+  sheet.getRange(cursor, 1).setValue('ВИТРАТИ З ПРИБУТКОВИХ КОШИКІВ').setFontWeight('bold').setFontSize(13);
+  sheet.getRange(cursor + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']]).setFontWeight('bold').setBackground('#fce5cd');
+  const profitBucketRows = calculateDashboardProfitBucketExpenseRows_(allocatedByCategory, spentByCategory);
+  sheet.getRange(cursor + 2, 1, profitBucketRows.length, 4).setValues(profitBucketRows);
+  sheet.getRange(cursor + 2, 2, profitBucketRows.length, 3).setNumberFormat('€#,##0.00');
+
+  cursor += profitBucketRows.length + 3;
   sheet.getRange(cursor, 1).setValue('КЕШФЛОУ ПО МІСЯЦЯХ').setFontWeight('bold').setFontSize(13);
   sheet.getRange(cursor + 1, 1, 1, 7).setValues([['Місяць', 'Виплата Amazon', 'Повернення собівартості', 'Прибуток до НДС', 'НДС до оплати', 'Чистий прибуток після НДС', 'Реально вільний кеш']]).setFontWeight('bold').setBackground('#cfe2f3');
   const monthRows = rows.map(function(row) {
