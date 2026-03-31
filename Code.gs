@@ -725,6 +725,8 @@ function importSettlementTxtFile_(fileId, options) {
     'Split Integrity Check: ' + parsed.splitIntegrity.status + ' (diff ' + fromCents_(parsed.splitIntegrity.diffC).toFixed(2) + ')',
     'Sales: ' + fromCents_(parsed.salesC).toFixed(2),
     'VAT: ' + fromCents_(parsed.vatC).toFixed(2),
+    'ItemPrice Total (gross): ' + fromCents_(parsed.itemPriceTotalC).toFixed(2),
+    'ItemFees Signed Total: ' + fromCents_(parsed.itemFeesSignedC).toFixed(2),
     'Fees: ' + fromCents_(parsed.feesExpenseC).toFixed(2),
     'Other: ' + fromCents_(parsed.otherC).toFixed(2),
     'Transfer: ' + fromCents_(parsed.transferC).toFixed(2),
@@ -881,6 +883,8 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
 
   let salesC = 0;
   let vatC = 0;
+  let itemPriceTotalC = 0;
+  let itemFeesSignedC = 0;
   let feesExpenseC = 0;
   let reimbursementsC = 0;
   let otherC = 0;
@@ -925,19 +929,24 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
         orderAgg[k].qty += qty;
         orderAgg[k].principalC += amountC;
       }
-      if (t === 'ItemPrice' && (d === 'Tax' || d === 'ShippingTax' || d === 'GiftWrapTax')) orderAgg[k].taxC += amountC;
-      if (t === 'ItemFees' || t === 'Fees') orderAgg[k].feesSignedC += amountC;
+      if (t === 'ItemPrice') {
+        const priceClass = classifyItemPriceComponent_(d);
+        if (priceClass.isTax) orderAgg[k].taxC += amountC;
+      }
+      if (t === 'ItemFees') orderAgg[k].feesSignedC += amountC;
     }
   }
 
   for (let m = 0; m < bucketMonths.length; m++) {
     const monthKey = bucketMonths[m];
     const bucket = bucketBuild.buckets[monthKey];
-    const agg = aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName);
+    const agg = aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName, warnings);
     summaryRows.push({ monthKey: monthKey, rowData: agg.rowData, stats: agg.stats });
 
     salesC += agg.salesC;
     vatC += agg.vatC;
+    itemPriceTotalC += agg.itemPriceTotalC;
+    itemFeesSignedC += agg.itemFeesSignedC;
     feesExpenseC += agg.feesExpenseC;
     reimbursementsC += agg.reimbursementsC;
     otherC += agg.otherC;
@@ -988,6 +997,8 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     payoutExReimbC: payoutExReimbC,
     salesC: salesC,
     vatC: vatC,
+    itemPriceTotalC: itemPriceTotalC,
+    itemFeesSignedC: itemFeesSignedC,
     feesExpenseC: feesExpenseC,
     feesRule: 'split-by-month bucket aggregation',
     reimbursementsC: reimbursementsC,
@@ -1041,7 +1052,8 @@ function buildSettlementMonthlyBuckets_(rows, idx, fallbackDepositDate, referenc
   return { buckets: out, stats: stats };
 }
 
-function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName) {
+function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositDate, marketplaceName, warnings) {
+  warnings = warnings || [];
   const rows = bucket && bucket.rows ? bucket.rows : [];
   const monthParts = String(bucket.monthKey || '').split('-');
   const monthDate = new Date(Date.UTC(Number(monthParts[0] || 1970), Number(monthParts[1] || 1) - 1, 1));
@@ -1049,11 +1061,14 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
   let transferC = 0;
   let salesC = 0;
   let vatC = 0;
+  let itemPriceTotalC = 0;
   let itemFeesSignedSumC = 0;
   let feeNeg = 0;
   let feePos = 0;
   let reimbursementsC = 0;
   const skuQtyMap = Object.create(null);
+  const unknownItemPriceDesc = Object.create(null);
+  const unknownItemFeesDesc = Object.create(null);
 
   const idxSku = idx['sku'];
   const idxQty = idx['quantity-purchased'];
@@ -1071,13 +1086,18 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
     const t = String(amountType || '').trim();
     const d = String(amountDesc || '').trim();
     if (t === 'ItemPrice') {
-      if (d === 'Principal' || d === 'Shipping' || d === 'GiftWrap') salesC += amountC;
-      else if (d === 'Tax' || d === 'ShippingTax' || d === 'GiftWrapTax') vatC += amountC;
+      itemPriceTotalC += amountC;
+      const priceClass = classifyItemPriceComponent_(d);
+      if (priceClass.isTax) vatC += amountC;
+      else salesC += amountC;
+      if (priceClass.isUnknown) unknownItemPriceDesc[d || '(empty)'] = (unknownItemPriceDesc[d || '(empty)'] || 0) + 1;
     }
-    if (t === 'ItemFees' || t === 'Fees') {
+    if (t === 'ItemFees') {
       itemFeesSignedSumC += amountC;
       if (amountC < 0) feeNeg++;
       if (amountC > 0) feePos++;
+      const feeClass = classifyItemFeesComponent_(d);
+      if (feeClass.isUnknown) unknownItemFeesDesc[d || '(empty)'] = (unknownItemFeesDesc[d || '(empty)'] || 0) + 1;
     }
 
     const sku = idxSku !== undefined ? normalizeSku_(row[idxSku]) : '';
@@ -1123,13 +1143,30 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
   rowData[CONFIG.HEADERS.cogsCoverage] = cogsRes.coveragePct;
   rowData[CONFIG.HEADERS.cogsStatus] = cogsRes.missingUnits > 0 ? 'MISSING_COST' : 'OK';
   rowData[CONFIG.HEADERS.missingSkus] = cogsRes.missingSkusText;
-  rowData[CONFIG.HEADERS.rowCheck] = rowCheck + ' | split ' + bucket.monthKey + ' rows:' + rows.length + ' posted:' + (bucket.postedDateRows || 0) + ' fallback:' + (bucket.depositFallbackRows || 0);
+  const unknownPriceKeys = Object.keys(unknownItemPriceDesc);
+  const unknownFeeKeys = Object.keys(unknownItemFeesDesc);
+  rowData[CONFIG.HEADERS.rowCheck] =
+    rowCheck +
+    ' | split ' + bucket.monthKey + ' rows:' + rows.length + ' posted:' + (bucket.postedDateRows || 0) + ' fallback:' + (bucket.depositFallbackRows || 0) +
+    ' | itemPriceTotal:' + fromCents_(itemPriceTotalC).toFixed(2) +
+    ' net:' + fromCents_(salesC).toFixed(2) +
+    ' tax:' + fromCents_(vatC).toFixed(2) +
+    ' | itemFeesSigned:' + fromCents_(itemFeesSignedSumC).toFixed(2);
+
+  if (unknownPriceKeys.length) {
+    warnings.push('[WARN] Unknown ItemPrice amount-description in ' + settlementId + ' month ' + bucket.monthKey + ': ' + unknownPriceKeys.join(', '));
+  }
+  if (unknownFeeKeys.length) {
+    warnings.push('[WARN] Unknown ItemFees amount-description in ' + settlementId + ' month ' + bucket.monthKey + ': ' + unknownFeeKeys.join(', '));
+  }
 
   return {
     monthKey: bucket.monthKey,
     transferC: transferC,
     salesC: salesC,
     vatC: vatC,
+    itemPriceTotalC: itemPriceTotalC,
+    itemFeesSignedC: itemFeesSignedSumC,
     feesExpenseC: feesExpenseC,
     reimbursementsC: reimbursementsC,
     otherC: otherC,
@@ -1137,7 +1174,17 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
     cogsRes: cogsRes,
     units: units,
     rowData: rowData,
-    stats: { rows: rows.length, postedDateRows: bucket.postedDateRows || 0, depositFallbackRows: bucket.depositFallbackRows || 0 }
+    stats: {
+      rows: rows.length,
+      postedDateRows: bucket.postedDateRows || 0,
+      depositFallbackRows: bucket.depositFallbackRows || 0,
+      itemPriceTotalC: itemPriceTotalC,
+      itemPriceNetC: salesC,
+      itemPriceTaxC: vatC,
+      itemFeesSignedC: itemFeesSignedSumC,
+      unknownItemPriceCount: unknownPriceKeys.length,
+      unknownItemFeesCount: unknownFeeKeys.length
+    }
   };
 }
 
@@ -1780,6 +1827,52 @@ function normalizeFeesExpenseC_(sumSignedC, negCount, posCount) {
   }
 
   return { feesExpenseC: expenseC, feesRule: rule };
+}
+
+function normalizeAmountDescriptionKey_(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function classifyItemPriceComponent_(amountDescription) {
+  const key = normalizeAmountDescriptionKey_(amountDescription);
+  if (!key) return { isTax: false, isUnknown: true, key: key };
+
+  const knownNet = {
+    principal: true,
+    shipping: true,
+    giftwrap: true
+  };
+  const knownTax = {
+    tax: true,
+    shippingtax: true,
+    giftwraptax: true
+  };
+
+  if (knownTax[key]) return { isTax: true, isUnknown: false, key: key };
+  if (knownNet[key]) return { isTax: false, isUnknown: false, key: key };
+  if (/(tax|vat|iva|mwst|tva)$/.test(key) || key.indexOf('tax') !== -1 || key.indexOf('vat') !== -1 || key.indexOf('iva') !== -1) {
+    return { isTax: true, isUnknown: true, key: key };
+  }
+  return { isTax: false, isUnknown: true, key: key };
+}
+
+function classifyItemFeesComponent_(amountDescription) {
+  const key = normalizeAmountDescriptionKey_(amountDescription);
+  if (!key) return { isUnknown: true, key: key };
+  const known = {
+    fbaperunitfulfillmentfee: true,
+    commission: true,
+    shippingchargeback: true,
+    digitalservicesfee: true,
+    fixedclosingfee: true,
+    variableclosingfee: true,
+    refundcommission: true
+  };
+  return { isUnknown: !known[key], key: key };
 }
 
 /* =========================
