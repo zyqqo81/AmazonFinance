@@ -53,12 +53,12 @@ const CONFIG = {
     marketplace: 'Країна',
     units: 'Units',
 
-    salesNet: 'Продажі (ItemPrice)',
-    vatDebito: 'ПДВ',
-    salesGross: 'Продажі з ПДВ (ItemPrice)',
-    salesVatOnly: 'ПДВ з продажів (ItemPrice Tax)',
-    salesNetOnly: 'Продажі без ПДВ (ItemPrice Net)',
-    feesCost: 'Комісії (ItemFees/Fees)',
+    salesNet: 'Продажі без ПДВ',
+    vatDebito: 'ПДВ з продажів',
+    salesGross: 'Продажі з ПДВ',
+    salesVatOnly: 'ПДВ з продажів',
+    salesNetOnly: 'Продажі без ПДВ',
+    feesCost: 'Комісії Amazon',
     amazonFeeVat: 'ПДВ у комісіях Amazon',
     amazonFeeVatDetectedRows: 'Fee rows with VAT detected',
     amazonFeeVatAmbiguousRows: 'Fee rows ambiguous VAT',
@@ -67,9 +67,9 @@ const CONFIG = {
     refundsTotal: 'Повернення / Refunds',
     shippingTotal: 'Доставки / Shipping',
     adjustmentsTotal: 'Інші коригування',
-    otherNet: 'Інші Комісії Other (net)',
-    transfer: 'Виплата на банк (Transfer)',
-    payoutExReimbursements: 'Виплата Amazon за продажі (без reimbursement)',
+    otherNet: 'Інші коригування',
+    transfer: 'Виплата Amazon',
+    payoutExReimbursements: 'Виплата Amazon без reimbursement',
 
     cogs: 'COGS (Last)',
     netProfit: 'Net Profit',
@@ -92,6 +92,39 @@ const CONFIG = {
     auditUrl: 'Audit URL',
     auditStatus: 'Audit Status'
   },
+
+  SUMMARY_HEADERS_ORDER: [
+    'Posted Date',
+    'Month',
+    'Settlement ID',
+    'Країна',
+    'Units',
+    'COGS (Last)',
+    'Units With Cost',
+    'Missing Units',
+    'COGS Coverage %',
+    'COGS Status',
+    'Продажі без ПДВ',
+    'ПДВ з продажів',
+    'Продажі з ПДВ',
+    'Комісії Amazon',
+    'ПДВ у комісіях Amazon',
+    'Повернення / Refunds',
+    'Доставки / Shipping',
+    'Інші коригування',
+    'Усі зарахування Amazon',
+    'Усі утримання Amazon',
+    'Виплата Amazon',
+    'Amazon Reimbursements',
+    'Виплата Amazon без reimbursement',
+    'Sold Profit',
+    'Profit Ex-Reimbursements',
+    'Чистий прибуток компанії',
+    'Файл',
+    'File ID',
+    'Імпортовано',
+    'Row Check'
+  ],
 
   PURCHASES: {
     skuHeader: 'SKU',
@@ -1304,7 +1337,7 @@ function validateSummarySheet_() {
   ensureSummaryHeaders_(sh);
   const hm = getHeaderMap_(sh);
 
-  const required = Object.keys(CONFIG.HEADERS).map(function(k) { return CONFIG.HEADERS[k]; });
+  const required = CONFIG.SUMMARY_HEADERS_ORDER.slice();
   const missing = required.filter(function(h) { return !hm[h]; });
   if (missing.length) throw new Error('Не вистачає заголовків: ' + missing.join(', '));
 
@@ -1714,13 +1747,54 @@ function ensureSummaryHeaders_(sheet) {
   const existing = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(v) { return String(v || '').trim(); }) : [];
 
   const set = new Set(existing.filter(function(x) { return !!x; }));
-  const needed = Object.keys(CONFIG.HEADERS).map(function(k) { return CONFIG.HEADERS[k]; });
+  const needed = CONFIG.SUMMARY_HEADERS_ORDER.slice();
   const toAdd = needed.filter(function(h) { return !set.has(h); });
 
   if (toAdd.length) sheet.getRange(1, lastCol + 1, 1, toAdd.length).setValues([toAdd]);
+  enforceSummarySchemaLayout_(sheet, needed);
 
   const hm = getHeaderMap_(sheet);
   applySummaryFormats_(sheet, hm, 2, Math.max(0, sheet.getLastRow() - 1), []);
+}
+
+function enforceSummarySchemaLayout_(sheet, requiredHeaders) {
+  const rowCount = Math.max(sheet.getLastRow(), 1);
+  const lastCol = Math.max(sheet.getLastColumn(), requiredHeaders.length, 1);
+  const currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(v) { return String(v || '').trim(); });
+  const extras = currentHeaders.filter(function(h) { return h && requiredHeaders.indexOf(h) === -1; });
+  const targetHeaders = requiredHeaders.concat(extras);
+  const needsReorder = targetHeaders.length !== currentHeaders.length || targetHeaders.some(function(h, i) { return currentHeaders[i] !== h; });
+
+  if (needsReorder) {
+    const data = sheet.getRange(1, 1, rowCount, lastCol).getValues();
+    const sourceMap = {};
+    for (let c = 0; c < currentHeaders.length; c++) {
+      const h = currentHeaders[c];
+      if (h && sourceMap[h] === undefined) sourceMap[h] = c;
+    }
+
+    const reordered = [];
+    for (let r = 0; r < data.length; r++) {
+      const rowOut = [];
+      for (let t = 0; t < targetHeaders.length; t++) {
+        const sourceIdx = sourceMap[targetHeaders[t]];
+        rowOut.push(sourceIdx === undefined ? '' : data[r][sourceIdx]);
+      }
+      reordered.push(rowOut);
+    }
+
+    sheet.clearContents();
+    sheet.getRange(1, 1, reordered.length, targetHeaders.length).setValues(reordered);
+  }
+
+  const requiredLen = requiredHeaders.length;
+  const totalCols = sheet.getLastColumn();
+  if (requiredLen > 0) sheet.showColumns(1, requiredLen);
+  if (totalCols > requiredLen) {
+    for (let col = requiredLen + 1; col <= totalCols; col++) {
+      sheet.hideColumns(col);
+    }
+  }
 }
 
 function formatSummaryRow_(sh, hm, row, warnings) {
