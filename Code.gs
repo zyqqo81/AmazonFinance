@@ -1754,7 +1754,9 @@ function ensureSummaryHeaders_(sheet) {
   enforceSummarySchemaLayout_(sheet, needed);
 
   const hm = getHeaderMap_(sheet);
-  applySummaryFormats_(sheet, hm, 2, Math.max(0, sheet.getLastRow() - 1), []);
+  safeRunSheetMutation_('applySummaryFormats_.ensureSummaryHeaders', function() {
+    applySummaryFormats_(sheet, hm, 2, Math.max(0, sheet.getLastRow() - 1), []);
+  });
 }
 
 function enforceSummarySchemaLayout_(sheet, requiredHeaders) {
@@ -1799,7 +1801,9 @@ function enforceSummarySchemaLayout_(sheet, requiredHeaders) {
 
 function formatSummaryRow_(sh, hm, row, warnings) {
   warnings = warnings || [];
-  applySummaryFormats_(sh, hm, row, 1, warnings);
+  safeRunSheetMutation_('applySummaryFormats_.singleRow', function() {
+    applySummaryFormats_(sh, hm, row, 1, warnings);
+  });
 }
 
 function findOrCreateRowByFileId_(sh, hm, fileIdRowMap, fileId) {
@@ -2233,6 +2237,31 @@ function getHeaderMap_(sheet) {
   }
 
   return map;
+}
+
+function findColumnByHeader_(sheet, headerName) {
+  if (!sheet || !headerName) return 0;
+  const hm = getHeaderMap_(sheet);
+  return Number(hm[String(headerName).trim()] || 0);
+}
+
+function safeRunSheetMutation_(label, fn) {
+  try {
+    return fn();
+  } catch (e) {
+    const msg = '[SHEET MUTATION WARN] ' + String(label || 'unknown') + ': ' + toErrorMessage_(e);
+    Logger.log(msg);
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      section: 'Sheet Mutation',
+      sheetName: '',
+      headerName: '',
+      operation: String(label || 'unknown'),
+      reason: 'MUTATION_ERROR',
+      message: toErrorMessage_(e)
+    });
+    return null;
+  }
 }
 
 function buildRowFromHeaderMap_(headerMap, outObj) {
@@ -2694,34 +2723,206 @@ function safeSetNumberFormat_(range, pattern, warnings, context) {
   }
 }
 
+function isProbablyTypedOrProtectedColumnError_(error) {
+  const msg = toErrorMessage_(error).toLowerCase();
+  return msg.indexOf('нельзя выбрать числовой формат') !== -1 ||
+    msg.indexOf('числовой формат ячеек') !== -1 ||
+    msg.indexOf('given data type') !== -1 ||
+    msg.indexOf('cannot set number format') !== -1 ||
+    msg.indexOf('data type') !== -1 ||
+    msg.indexOf('smart chip') !== -1 ||
+    msg.indexOf('dropdown') !== -1 ||
+    msg.indexOf('data validation') !== -1 ||
+    msg.indexOf('protected') !== -1 ||
+    msg.indexOf('you cannot') !== -1;
+}
+
+function getDataRowCountForColumn_(sheet, col, options) {
+  if (!sheet || !col) return 0;
+  const cfg = options || {};
+  const headerRow = Number(cfg.headerRow || 1);
+  const startRow = Number(cfg.startRow || (headerRow + 1));
+  const lastRow = sheet.getLastRow();
+  if (lastRow < startRow) return 0;
+  return lastRow - startRow + 1;
+}
+
+function appendDiagnosticsLog_(entry) {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    if (!ss) return;
+    let sh = ss.getSheetByName(CONFIG.DIAGNOSTICS_SHEET);
+    if (!sh) sh = ss.insertSheet(CONFIG.DIAGNOSTICS_SHEET);
+    if (sh.getLastRow() < 1) {
+      sh.getRange(1, 1, 1, 6).setValues([['timestamp', 'sheet', 'header', 'operation', 'reason', 'message']]);
+    }
+    const row = [
+      Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss'),
+      entry.sheetName || '',
+      entry.headerName || '',
+      entry.operation || '',
+      entry.reason || '',
+      entry.message || ''
+    ];
+    sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  } catch (e) {
+    Logger.log('[DIAG LOG WARN] ' + toErrorMessage_(e));
+  }
+}
+
+function logFormatSkip_(sheetName, headerName, reason, operation, errorMessage) {
+  const msg = [
+    '[FORMAT SKIP]',
+    sheetName || '',
+    headerName || '',
+    operation || 'format',
+    reason || 'SKIPPED',
+    errorMessage || ''
+  ].join(' | ');
+  Logger.log(msg);
+  appendDiagnosticsLog_({
+    level: 'WARN',
+    section: 'Formatting',
+    sheetName: sheetName || '',
+    headerName: headerName || '',
+    operation: operation || 'format',
+    reason: reason || 'SKIPPED',
+    message: errorMessage || ''
+  });
+}
+
+function safeSetNumberFormatByHeader_(sheet, headerName, formatPattern, options) {
+  return safeRunSheetMutation_('safeSetNumberFormatByHeader_:' + (sheet ? sheet.getName() : '') + ':' + headerName, function() {
+    if (!sheet || !headerName || !formatPattern) return false;
+    const col = findColumnByHeader_(sheet, headerName);
+    if (!col) {
+      logFormatSkip_(sheet.getName(), headerName, 'HEADER_NOT_FOUND', 'setNumberFormat');
+      return false;
+    }
+    const cfg = options || {};
+    const dataRows = getDataRowCountForColumn_(sheet, col, cfg);
+    if (dataRows <= 0) {
+      logFormatSkip_(sheet.getName(), headerName, 'NO_DATA_ROWS', 'setNumberFormat');
+      return false;
+    }
+    const headerRow = Number(cfg.headerRow || 1);
+    const startRow = Number(cfg.startRow || (headerRow + 1));
+    const range = sheet.getRange(startRow, col, dataRows, 1);
+    try {
+      range.setNumberFormat(formatPattern);
+      return true;
+    } catch (e) {
+      const reason = isProbablyTypedOrProtectedColumnError_(e) ? 'TYPED_OR_PROTECTED_COLUMN' : 'UNEXPECTED_FORMAT_ERROR';
+      logFormatSkip_(sheet.getName(), headerName, reason, 'setNumberFormat', toErrorMessage_(e));
+      return false;
+    }
+  });
+}
+
+function safeSetAlignmentByHeader_(sheet, headerName, horizontal, vertical, options) {
+  return safeRunSheetMutation_('safeSetAlignmentByHeader_:' + (sheet ? sheet.getName() : '') + ':' + headerName, function() {
+    if (!sheet || !headerName) return false;
+    const col = findColumnByHeader_(sheet, headerName);
+    if (!col) {
+      logFormatSkip_(sheet.getName(), headerName, 'HEADER_NOT_FOUND', 'setAlignment');
+      return false;
+    }
+    const cfg = options || {};
+    const dataRows = getDataRowCountForColumn_(sheet, col, cfg);
+    if (dataRows <= 0) return false;
+    const headerRow = Number(cfg.headerRow || 1);
+    const startRow = Number(cfg.startRow || (headerRow + 1));
+    const range = sheet.getRange(startRow, col, dataRows, 1);
+    try {
+      if (horizontal) range.setHorizontalAlignment(horizontal);
+      if (vertical) range.setVerticalAlignment(vertical);
+      return true;
+    } catch (e) {
+      logFormatSkip_(sheet.getName(), headerName, 'ALIGNMENT_ERROR', 'setAlignment', toErrorMessage_(e));
+      return false;
+    }
+  });
+}
+
+function safeSetWrapByHeader_(sheet, headerName, wrapStrategy, options) {
+  return safeRunSheetMutation_('safeSetWrapByHeader_:' + (sheet ? sheet.getName() : '') + ':' + headerName, function() {
+    if (!sheet || !headerName) return false;
+    const col = findColumnByHeader_(sheet, headerName);
+    if (!col) {
+      logFormatSkip_(sheet.getName(), headerName, 'HEADER_NOT_FOUND', 'setWrap');
+      return false;
+    }
+    const cfg = options || {};
+    const dataRows = getDataRowCountForColumn_(sheet, col, cfg);
+    if (dataRows <= 0) return false;
+    const headerRow = Number(cfg.headerRow || 1);
+    const startRow = Number(cfg.startRow || (headerRow + 1));
+    const range = sheet.getRange(startRow, col, dataRows, 1);
+    try {
+      if (wrapStrategy === 'WRAP') range.setWrap(true);
+      else if (wrapStrategy === 'OVERFLOW') range.setWrap(false);
+      else if (wrapStrategy === 'CLIP') range.setWrap(false);
+      return true;
+    } catch (e) {
+      logFormatSkip_(sheet.getName(), headerName, 'WRAP_ERROR', 'setWrap', toErrorMessage_(e));
+      return false;
+    }
+  });
+}
+
+function safeApplyColumnFormatPlan_(sheet, plan) {
+  if (!sheet || !Array.isArray(plan) || !plan.length) return;
+  for (let i = 0; i < plan.length; i++) {
+    const item = plan[i] || {};
+    const headerName = item.headerName || item.header;
+    if (!headerName) continue;
+    if (item.numberFormat) safeSetNumberFormatByHeader_(sheet, headerName, item.numberFormat, item.options);
+    if (item.horizontal || item.vertical) safeSetAlignmentByHeader_(sheet, headerName, item.horizontal, item.vertical, item.options);
+    if (item.wrapStrategy) safeSetWrapByHeader_(sheet, headerName, item.wrapStrategy, item.options);
+  }
+}
+
 function applySummaryFormats_(sheet, hm, startRow, rowCount, warnings) {
   warnings = warnings || [];
   if (!sheet || !hm || !startRow || rowCount <= 0) return;
+  const options = { startRow: startRow, headerRow: 1 };
+  const moneyFormat = '#,##0.00';
+  const plan = [
+    { headerName: 'Deposit Date', numberFormat: 'dd.mm.yyyy', options: options },
+    { headerName: 'Posted Date', numberFormat: 'dd.mm.yyyy', options: options },
+    { headerName: 'Month', numberFormat: 'yyyy-MM', options: options },
+    { headerName: 'Імпортовано', numberFormat: 'dd.mm.yyyy HH:mm:ss', options: options },
 
-  const dateCols = [hm[CONFIG.HEADERS.depositDate], hm[CONFIG.HEADERS.postedDate], hm[CONFIG.HEADERS.month], hm[CONFIG.HEADERS.importedAt]].filter(Boolean);
-  for (let i = 0; i < dateCols.length; i++) {
-    const col = dateCols[i];
-    const fmt = col === hm[CONFIG.HEADERS.month] ? 'yyyy-MM' : (col === hm[CONFIG.HEADERS.importedAt] ? 'dd.mm.yyyy HH:mm:ss' : 'dd.mm.yyyy');
-    safeSetNumberFormat_(sheet.getRange(startRow, col, rowCount, 1), fmt, warnings, 'summary.date.col' + col);
-  }
+    { headerName: 'Units', numberFormat: '0', options: options },
+    { headerName: 'Units With Cost', numberFormat: '0', options: options },
+    { headerName: 'Missing Units', numberFormat: '0', options: options },
 
-  const moneyCols = [
-    hm[CONFIG.HEADERS.salesNet], hm[CONFIG.HEADERS.vatDebito], hm[CONFIG.HEADERS.feesCost], hm[CONFIG.HEADERS.otherNet],
-    hm[CONFIG.HEADERS.transfer], hm[CONFIG.HEADERS.payoutExReimbursements], hm[CONFIG.HEADERS.cogs], hm[CONFIG.HEADERS.netProfit], hm[CONFIG.HEADERS.amazonReimbursements],
-    hm[CONFIG.HEADERS.soldProfit], hm[CONFIG.HEADERS.profitExReimbursements], hm[CONFIG.HEADERS.companyProfit]
-  ].filter(Boolean);
-  for (let i = 0; i < moneyCols.length; i++) {
-    safeSetNumberFormat_(sheet.getRange(startRow, moneyCols[i], rowCount, 1), '#,##0.00', warnings, 'summary.money.col' + moneyCols[i]);
-  }
+    { headerName: 'COGS Coverage %', numberFormat: '0.00%', options: options },
 
-  const intCols = [hm[CONFIG.HEADERS.units], hm[CONFIG.HEADERS.unitsWithCost], hm[CONFIG.HEADERS.missingUnits]].filter(Boolean);
-  for (let i = 0; i < intCols.length; i++) {
-    safeSetNumberFormat_(sheet.getRange(startRow, intCols[i], rowCount, 1), '0', warnings, 'summary.int.col' + intCols[i]);
-  }
+    { headerName: 'COGS (Last)', numberFormat: moneyFormat, options: options },
+    { headerName: 'Продажі без ПДВ', numberFormat: moneyFormat, options: options },
+    { headerName: 'ПДВ з продажів', numberFormat: moneyFormat, options: options },
+    { headerName: 'Продажі з ПДВ', numberFormat: moneyFormat, options: options },
+    { headerName: 'Комісії Amazon', numberFormat: moneyFormat, options: options },
+    { headerName: 'ПДВ у комісіях Amazon', numberFormat: moneyFormat, options: options },
+    { headerName: 'Повернення / Refunds', numberFormat: moneyFormat, options: options },
+    { headerName: 'Повернення / Refund', numberFormat: moneyFormat, options: options },
+    { headerName: 'Доставки / Shipping', numberFormat: moneyFormat, options: options },
+    { headerName: 'Доставка / shipping', numberFormat: moneyFormat, options: options },
+    { headerName: 'Інші коригування', numberFormat: moneyFormat, options: options },
+    { headerName: 'Усі зарахування Amazon', numberFormat: moneyFormat, options: options },
+    { headerName: 'Усі утримання Amazon', numberFormat: moneyFormat, options: options },
+    { headerName: 'Виплата Amazon', numberFormat: moneyFormat, options: options },
+    { headerName: 'Amazon Reimbursements', numberFormat: moneyFormat, options: options },
+    { headerName: 'Amazon reimbursements', numberFormat: moneyFormat, options: options },
+    { headerName: 'Sold Profit', numberFormat: moneyFormat, options: options },
+    { headerName: 'Profit Ex-Reimbursements', numberFormat: moneyFormat, options: options },
+    { headerName: 'Виплата Amazon без reimbursement', numberFormat: moneyFormat, options: options },
+    { headerName: 'Виплата Amazon за продажі (без reimbursement)', numberFormat: moneyFormat, options: options },
+    { headerName: 'Чистий прибуток компанії', numberFormat: moneyFormat, options: options }
+  ];
 
-  if (hm[CONFIG.HEADERS.cogsCoverage]) {
-    safeSetNumberFormat_(sheet.getRange(startRow, hm[CONFIG.HEADERS.cogsCoverage], rowCount, 1), '0.00%', warnings, 'summary.coverage');
-  }
+  safeApplyColumnFormatPlan_(sheet, plan);
 }
 
 function applyAuditFormats_(sheet, dataStartRow, rowCount, formats, warnings) {
@@ -3020,7 +3221,9 @@ function importTaxReportCsvFromFileId_(fileId, groupDateField) {
   sheet.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
   if (rawRows.length) {
     sheet.getRange(2, 1, rawRows.length, finalHeaders.length).setValues(rawRows);
-    applyTaxRawFormats_(sheet, rawRows.length, headers.length, TAX_COMPUTED_HEADERS.length);
+    safeRunSheetMutation_('applyTaxRawFormats_', function() {
+      applyTaxRawFormats_(sheet, rawRows.length, headers.length, TAX_COMPUTED_HEADERS.length);
+    });
   }
   return { rows: rawRows.length };
 }
@@ -3030,13 +3233,13 @@ function applyTaxRawFormats_(sheet, rowCount, sourceColsCount, computedColsCount
 
   if (sourceColsCount > 0) {
     // Keep imported CSV values as plain text so decimal values like "01.09" are not auto-converted to dates.
-    sheet.getRange(2, 1, rowCount, sourceColsCount).setNumberFormat('@');
+    safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, sourceColsCount), '@', [], 'taxRaw.source');
   }
 
   if (computedColsCount > 0) {
-    sheet.getRange(2, sourceColsCount + 1, rowCount, 1).setNumberFormat('yyyy-MM');
+    safeSetNumberFormat_(sheet.getRange(2, sourceColsCount + 1, rowCount, 1), 'yyyy-MM', [], 'taxRaw.computed.month');
     if (computedColsCount > 1) {
-      sheet.getRange(2, sourceColsCount + 2, rowCount, computedColsCount - 1).setNumberFormat('#,##0.00');
+      safeSetNumberFormat_(sheet.getRange(2, sourceColsCount + 2, rowCount, computedColsCount - 1), '#,##0.00', [], 'taxRaw.computed.money');
     }
   }
 }
@@ -3368,8 +3571,8 @@ function writeCurrentMonthSnapshotSheet_(snapshot) {
   sheet.getRange(1, 1, 1, 2).setValues([headers]);
   sheet.getRange(2, 1, rows.length, 2).setValues(rows);
 
-  sheet.getRange(2, 2, 4, 1).setNumberFormat('0');
-  sheet.getRange(6, 2, 11, 1).setNumberFormat('#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(2, 2, 4, 1), '0', [], 'snapshot.int');
+  safeSetNumberFormat_(sheet.getRange(6, 2, 11, 1), '#,##0.00', [], 'snapshot.money');
 }
 
 function resolveHeaderName_(hm, expectedHeader) {
@@ -6288,10 +6491,16 @@ function rebuildDashboard_() {
     .concat(monthlyWarnings)
     .concat((manualByCategory && manualByCategory.warnings) || [])
     .concat((workingCapitalAgg && workingCapitalAgg.warnings) || []);
-  renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory, workingCapitalAgg, workingCapitalTotals, dashboardWarnings);
-  renderDashboardCharts_(dashboard, monthlyRows, workingCapitalAgg);
-  dashboard.autoResizeColumns(1, 8);
-  dashboard.setFrozenRows(2);
+  safeRunSheetMutation_('renderDashboardBlocks_', function() {
+    renderDashboardBlocks_(dashboard, monthlyRows, manualByCategory, workingCapitalAgg, workingCapitalTotals, dashboardWarnings);
+  });
+  safeRunSheetMutation_('renderDashboardCharts_', function() {
+    renderDashboardCharts_(dashboard, monthlyRows, workingCapitalAgg);
+  });
+  safeRunSheetMutation_('dashboard.finalize', function() {
+    dashboard.autoResizeColumns(1, 8);
+    dashboard.setFrozenRows(2);
+  });
 
   return { empty: false, months: monthlyRows.length, latestMonth: monthlyRows[monthlyRows.length - 1].month };
 }
@@ -6548,13 +6757,15 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
     const col = 1 + (i % 4) * 2;
     const row = 4 + Math.floor(i / 4) * 3;
     sheet.getRange(row, col, 1, 2).merge().setValue(kpiHeaders[i]).setFontWeight('bold').setBackground('#e8f0fe');
-    sheet.getRange(row + 1, col, 1, 2).merge().setValue(kpiValues[i]).setFontSize(14).setFontWeight('bold').setNumberFormat('€#,##0.00');
+    const kpiValueRange = sheet.getRange(row + 1, col, 1, 2).merge().setValue(kpiValues[i]).setFontSize(14).setFontWeight('bold');
+    safeSetNumberFormat_(kpiValueRange, '€#,##0.00', [], 'dashboard.kpi.value');
   }
 
   let cursor = 11;
   sheet.getRange(cursor, 1).setValue('Поточний місяць: ' + latest.month).setFontWeight('bold').setFontSize(13);
   sheet.getRange(cursor + 1, 1, 1, 6).setValues([['Виплата Amazon', 'Повернення собівартості', 'Прибуток до НДС', 'НДС до оплати', 'Чистий прибуток після НДС', 'Реально вільний кеш']]).setFontWeight('bold').setBackground('#f3f3f3');
-  sheet.getRange(cursor + 2, 1, 1, 6).setValues([[latest.payout, latest.cogs, latest.profitBeforeVat, latest.vatToPay, latest.cashAfterVat, latest.freeCash]]).setNumberFormat('€#,##0.00').setFontWeight('bold');
+  const latestRange = sheet.getRange(cursor + 2, 1, 1, 6).setValues([[latest.payout, latest.cogs, latest.profitBeforeVat, latest.vatToPay, latest.cashAfterVat, latest.freeCash]]).setFontWeight('bold');
+  safeSetNumberFormat_(latestRange, '€#,##0.00', [], 'dashboard.latest');
 
   cursor += 4;
   sheet.getRange(cursor, 1).setValue('VAT БЛОК').setFontWeight('bold').setFontSize(13);
@@ -6567,7 +6778,7 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   ];
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#ead1dc');
   sheet.getRange(cursor + 2, 1, vatBlockRows.length, 2).setValues(vatBlockRows);
-  sheet.getRange(cursor + 2, 2, vatBlockRows.length, 1).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, vatBlockRows.length, 1), '€#,##0.00', [], 'dashboard.vatBlock');
 
   cursor += vatBlockRows.length + 3;
   sheet.getRange(cursor, 1).setValue('AMAZON SETTLEMENT-FLOW').setFontWeight('bold').setFontSize(13);
@@ -6580,7 +6791,7 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   ];
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#d9ead3');
   sheet.getRange(cursor + 2, 1, flowRows.length, 2).setValues(flowRows);
-  sheet.getRange(cursor + 2, 2, flowRows.length, 1).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, flowRows.length, 1), '€#,##0.00', [], 'dashboard.flow');
 
   cursor += flowRows.length + 3;
   sheet.getRange(cursor, 1).setValue('СТРУКТУРА ВИПЛАТИ AMAZON').setFontWeight('bold').setFontSize(13);
@@ -6594,8 +6805,8 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
     ['Реально вільний кеш', latest.freeCash, percentOf_(latest.freeCash, latest.payout)]
   ];
   sheet.getRange(cursor + 2, 1, structureRows.length, 3).setValues(structureRows);
-  sheet.getRange(cursor + 2, 2, structureRows.length, 1).setNumberFormat('€#,##0.00');
-  sheet.getRange(cursor + 2, 3, structureRows.length, 1).setNumberFormat('0.00"%"');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, structureRows.length, 1), '€#,##0.00', [], 'dashboard.structure.money');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 3, structureRows.length, 1), '0.00"%"', [], 'dashboard.structure.percent');
 
   cursor += structureRows.length + 3;
   sheet.getRange(cursor, 1).setValue('КЕШФЛОУ ТА РЕЗЕРВИ').setFontWeight('bold').setFontSize(13);
@@ -6609,7 +6820,7 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   ];
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#fff2cc');
   sheet.getRange(cursor + 2, 1, cashflowRows.length, 2).setValues(cashflowRows);
-  sheet.getRange(cursor + 2, 2, cashflowRows.length, 1).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, cashflowRows.length, 1), '€#,##0.00', [], 'dashboard.cashflow');
 
   cursor += cashflowRows.length + 3;
   sheet.getRange(cursor, 1).setValue('ПОВЕРНЕННЯ В ОБОРОТ').setFontWeight('bold').setFontSize(13);
@@ -6622,8 +6833,8 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   ];
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Значення']]).setFontWeight('bold').setBackground('#fce5cd');
   sheet.getRange(cursor + 2, 1, returnRows.length, 2).setValues(returnRows);
-  sheet.getRange(cursor + 2, 2, 2, 1).setNumberFormat('€#,##0.00');
-  sheet.getRange(cursor + 4, 2, 2, 1).setNumberFormat('0.00"%"');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, 2, 1), '€#,##0.00', [], 'dashboard.return.money');
+  safeSetNumberFormat_(sheet.getRange(cursor + 4, 2, 2, 1), '0.00"%"', [], 'dashboard.return.percent');
 
   cursor += returnRows.length + 3;
   sheet.getRange(cursor, 1).setValue('НДС РЕЗЕРВ').setFontWeight('bold').setFontSize(13);
@@ -6636,7 +6847,7 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   ];
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#ead1dc');
   sheet.getRange(cursor + 2, 1, vatReserveRows.length, 2).setValues(vatReserveRows);
-  sheet.getRange(cursor + 2, 2, vatReserveRows.length, 1).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, vatReserveRows.length, 1), '€#,##0.00', [], 'dashboard.vatReserve');
   const vatRiskCell = sheet.getRange(cursor + 4, 2);
   if (totals.vatToPay > 0) vatRiskCell.setBackground('#f4cccc').setFontColor('#b71c1c').setFontWeight('bold');
   else vatRiskCell.setBackground('#d9ead3').setFontColor('#1b5e20').setFontWeight('bold');
@@ -6648,14 +6859,14 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
   sheet.getRange(cursor + 1, 1, 1, 2).setValues([['Категорія', 'Виділено з прибутку']]).setFontWeight('bold').setBackground('#fff2cc');
   const profitDistributionRows = calculateDashboardProfitDistributionRows_(allocatedByCategory);
   sheet.getRange(cursor + 2, 1, profitDistributionRows.length, 2).setValues(profitDistributionRows);
-  sheet.getRange(cursor + 2, 2, profitDistributionRows.length, 1).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, profitDistributionRows.length, 1), '€#,##0.00', [], 'dashboard.profitDistribution');
 
   cursor += profitDistributionRows.length + 3;
   sheet.getRange(cursor, 1).setValue('ФОНДИ КОШТІВ').setFontWeight('bold').setFontSize(13);
   sheet.getRange(cursor + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишилось']]).setFontWeight('bold').setBackground('#d9ead3');
   const operationalFundRows = calculateDashboardOperationalFundRows_(totals, allocatedByCategory, spentByCategory);
   sheet.getRange(cursor + 2, 1, operationalFundRows.length, 4).setValues(operationalFundRows);
-  sheet.getRange(cursor + 2, 2, operationalFundRows.length, 3).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, operationalFundRows.length, 3), '€#,##0.00', [], 'dashboard.funds');
   sheet.getRange(cursor + 2, 1).setNote('Виділено = Собівартість до повернення + Реінвест із прибутку.');
   const operationalNegativeRows = getDashboardOperationalFundNegativeRows_(operationalFundRows);
   for (let i = 0; i < operationalNegativeRows.length; i++) {
@@ -6669,8 +6880,8 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
     return [row.month, row.payout, row.cogs, row.profitBeforeVat, row.vatToPay, row.cashAfterVat, row.freeCash];
   });
   sheet.getRange(cursor + 2, 1, monthRows.length, 7).setValues(monthRows);
-  sheet.getRange(cursor + 2, 1, monthRows.length, 1).setNumberFormat('@');
-  sheet.getRange(cursor + 2, 2, monthRows.length, 6).setNumberFormat('€#,##0.00');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 1, monthRows.length, 1), '@', [], 'dashboard.monthRows.text');
+  safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, monthRows.length, 6), '€#,##0.00', [], 'dashboard.monthRows.money');
 
   cursor += monthRows.length + 3;
   const workingCapitalRows = (workingCapitalAgg && workingCapitalAgg.rows) ? workingCapitalAgg.rows.slice() : [];
@@ -6698,8 +6909,8 @@ function renderDashboardBlocks_(sheet, rows, manualByCategoryAgg, workingCapital
       ];
     });
     sheet.getRange(cursor + 2, 1, wcTable.length, 7).setValues(wcTable);
-    sheet.getRange(cursor + 2, 1, wcTable.length, 1).setNumberFormat('@');
-    sheet.getRange(cursor + 2, 2, wcTable.length, 6).setNumberFormat('€#,##0.00');
+    safeSetNumberFormat_(sheet.getRange(cursor + 2, 1, wcTable.length, 1), '@', [], 'dashboard.wc.text');
+    safeSetNumberFormat_(sheet.getRange(cursor + 2, 2, wcTable.length, 6), '€#,##0.00', [], 'dashboard.wc.money');
   } else {
     sheet.getRange(cursor + 2, 1).setValue('Немає активних даних у листі ' + getWorkingCapitalSheetName_() + '.').setFontColor('#777777');
   }
@@ -6750,8 +6961,8 @@ function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
     sheet.getRange(startRow, chartStartCol, 1, 2).setValues([['Місяць', 'Оборотний капітал']]);
     const wcChartRows = wcRows.map(function(row) { return [row.month, row.workingCapital]; });
     sheet.getRange(startRow + 1, chartStartCol, wcChartRows.length, 2).setValues(wcChartRows);
-    sheet.getRange(startRow + 1, chartStartCol, wcChartRows.length, 1).setNumberFormat('@');
-    sheet.getRange(startRow + 1, chartStartCol + 1, wcChartRows.length, 1).setNumberFormat('€#,##0.00');
+    safeSetNumberFormat_(sheet.getRange(startRow + 1, chartStartCol, wcChartRows.length, 1), '@', [], 'dashboard.chart.wc.month');
+    safeSetNumberFormat_(sheet.getRange(startRow + 1, chartStartCol + 1, wcChartRows.length, 1), '€#,##0.00', [], 'dashboard.chart.wc.money');
 
     const workingCapitalChart = sheet.newChart()
       .asLineChart()
