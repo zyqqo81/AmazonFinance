@@ -1144,9 +1144,10 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
   let feeVatIncludedC = 0;
   let feeVatDetectedRows = 0;
   let feeVatAmbiguousRows = 0;
+  let feeVatExcludedRows = 0;
   const skuQtyMap = Object.create(null);
   const unknownItemPriceDesc = Object.create(null);
-  const unknownItemFeesDesc = Object.create(null);
+  const itemFeeMetrics = createItemFeeMetricsBucket_();
   const amountTypeTotals = Object.create(null);
 
   const idxSku = idx['sku'];
@@ -1181,14 +1182,20 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
       itemFeesSignedSumC += amountC;
       if (amountC < 0) feeNeg++;
       if (amountC > 0) feePos++;
-      const feeClass = classifyItemFeesComponent_(d);
-      if (feeClass.isUnknown) unknownItemFeesDesc[d || '(empty)'] = (unknownItemFeesDesc[d || '(empty)'] || 0) + 1;
-      const feeVatClass = classifyFeeVatTreatment_(row, idx, amountType, amountDesc, transactionType);
-      if (feeVatClass.treatment === 'included') {
-        const vatPartC = extractVatFromGrossFeeC_(amountC, feeVatClass.rate || 0.22);
+      const feeClass = classifyItemFeeRow_(row, idx);
+      if (feeClass.isUnknown) {
+        itemFeeMetrics.unknownByDescription[feeClass.sourceDescription || '(empty)'] =
+          (itemFeeMetrics.unknownByDescription[feeClass.sourceDescription || '(empty)'] || 0) + 1;
+      }
+      const vatClass = determineItemFeeVatTreatment_(row, idx, feeClass);
+      accumulateItemFeeMetrics_(itemFeeMetrics, row, feeClass, vatClass, amountC);
+      if (vatClass.treatment === 'included') {
+        const vatPartC = extractVatFromGrossFeeC_(amountC, vatClass.rate || 0.22);
         feeVatIncludedC += vatPartC;
         feeVatDetectedRows += 1;
-      } else if (feeVatClass.treatment === 'ambiguous') {
+      } else if (vatClass.treatment === 'excluded') {
+        feeVatExcludedRows += 1;
+      } else if (vatClass.treatment === 'ambiguous') {
         feeVatAmbiguousRows += 1;
       }
     }
@@ -1259,7 +1266,7 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
   rowData[CONFIG.HEADERS.cogsStatus] = cogsRes.missingUnits > 0 ? 'MISSING_COST' : 'OK';
   rowData[CONFIG.HEADERS.missingSkus] = cogsRes.missingSkusText;
   const unknownPriceKeys = Object.keys(unknownItemPriceDesc);
-  const unknownFeeKeys = Object.keys(unknownItemFeesDesc);
+  const unknownFeeKeys = Object.keys(itemFeeMetrics.unknownByDescription);
   rowData[CONFIG.HEADERS.rowCheck] =
     rowCheck +
     ' | split ' + bucket.monthKey + ' rows:' + rows.length + ' posted:' + (bucket.postedDateRows || 0) + ' fallback:' + (bucket.depositFallbackRows || 0) +
@@ -1276,9 +1283,28 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
   }
   if (unknownFeeKeys.length) {
     warnings.push('[WARN] Unknown ItemFees amount-description in ' + settlementId + ' month ' + bucket.monthKey + ': ' + unknownFeeKeys.join(', '));
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      warningType: 'ITEMFEES_UNKNOWN_DESCRIPTION',
+      settlementId: settlementId,
+      month: bucket.monthKey,
+      operation: 'aggregateSettlementBucket_',
+      message: unknownFeeKeys.join(', '),
+      affectedRows: itemFeeMetrics.unknownRows
+    });
   }
   if (feeVatAmbiguousRows > 0) {
-    warnings.push('[WARN] Ambiguous VAT treatment in ItemFees rows for ' + settlementId + ' month ' + bucket.monthKey + ': ' + feeVatAmbiguousRows);
+    const vatWarnSummary = buildItemFeeWarningSummary_(settlementId, bucket.monthKey, itemFeeMetrics);
+    if (vatWarnSummary) warnings.push(vatWarnSummary);
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      warningType: 'ITEMFEES_VAT_AMBIGUOUS',
+      settlementId: settlementId,
+      month: bucket.monthKey,
+      operation: 'aggregateSettlementBucket_',
+      message: 'Ambiguous VAT ItemFees classes: ' + Object.keys(itemFeeMetrics.ambiguousClassCounts).join(', '),
+      affectedRows: feeVatAmbiguousRows
+    });
   }
 
   return {
@@ -1305,6 +1331,7 @@ function aggregateSettlementBucket_(bucket, idx, costMap, settlementId, depositD
       itemFeesSignedC: itemFeesSignedSumC,
       feeVatIncludedC: feeVatIncludedC,
       feeVatDetectedRows: feeVatDetectedRows,
+      feeVatExcludedRows: feeVatExcludedRows,
       feeVatAmbiguousRows: feeVatAmbiguousRows,
       creditsC: creditsC,
       debitsAbsC: debitsAbsC,
@@ -1501,18 +1528,18 @@ function applyRowCheckAll_() {
 
   ensureSummaryHeaders_(sh);
   const hm = getHeaderMap_(sh);
-
-  const req = [
-    hm[CONFIG.HEADERS.salesNet],
-    hm[CONFIG.HEADERS.vatDebito],
-    hm[CONFIG.HEADERS.otherNet],
-    hm[CONFIG.HEADERS.feesCost],
-    hm[CONFIG.HEADERS.transfer],
-    hm[CONFIG.HEADERS.rowCheck],
-    hm[CONFIG.HEADERS.fileId]
-  ];
-
-  if (req.some(function(c) { return !c; })) return;
+  const requiredForWrite = [CONFIG.HEADERS.fileId, CONFIG.HEADERS.rowCheck];
+  if (!hasAllRequiredHeaders_(sh, requiredForWrite, hm)) {
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      warningType: 'ROW_CHECK_MISSING_HEADERS',
+      sheetName: sh.getName(),
+      operation: 'applyRowCheckAll_',
+      message: 'Missing required headers for Row Check write stage.',
+      affectedRows: 0
+    });
+    return;
+  }
 
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return;
@@ -1523,21 +1550,46 @@ function applyRowCheckAll_() {
 }
 
 function applyRowCheckAtRow_(sh, hm, r) {
-  const fid = String(sh.getRange(r, hm[CONFIG.HEADERS.fileId]).getValue() || '').trim();
+  const fid = String(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.fileId, hm, '') || '').trim();
   if (!fid || fid === CONFIG.TOTAL_FILE_ID) {
-    sh.getRange(r, hm[CONFIG.HEADERS.rowCheck]).clearContent();
+    safeSetSingleCellByHeader_(sh, r, CONFIG.HEADERS.rowCheck, '', hm);
     return;
   }
 
-  const salesC = toCents_(sh.getRange(r, hm[CONFIG.HEADERS.salesNet]).getValue());
-  const vatC = toCents_(sh.getRange(r, hm[CONFIG.HEADERS.vatDebito]).getValue());
-  const otherC = toCents_(sh.getRange(r, hm[CONFIG.HEADERS.otherNet]).getValue());
-  const feesC = toCents_(sh.getRange(r, hm[CONFIG.HEADERS.feesCost]).getValue());
-  const transferC = toCents_(sh.getRange(r, hm[CONFIG.HEADERS.transfer]).getValue());
+  const hasSalesGross = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.salesGross, hm);
+  const hasSalesNet = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.salesNet, hm);
+  const hasVatDebito = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.vatDebito, hm);
+  const hasOther = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.otherNet, hm);
+  const hasFees = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.feesCost, hm);
+  const hasTransfer = !!findRequiredColumnOrNull_(sh, CONFIG.HEADERS.transfer, hm);
 
-  const diffC = (salesC + vatC + otherC - feesC) - transferC;
-  const status = Math.abs(diffC) <= 1 ? 'OK' : ('ERR diff ' + fromCents_(diffC).toFixed(2));
-  sh.getRange(r, hm[CONFIG.HEADERS.rowCheck]).setValue(status);
+  const hasSalesBasis = hasSalesGross || (hasSalesNet && hasVatDebito);
+  if (!hasSalesBasis || !hasOther || !hasFees || !hasTransfer) {
+    const statusSkip = 'SKIP: missing headers';
+    safeSetSingleCellByHeader_(sh, r, CONFIG.HEADERS.rowCheck, statusSkip, hm);
+    appendDiagnosticsLog_({
+      level: 'INFO',
+      warningType: 'ROW_CHECK_MISSING_HEADERS',
+      sheetName: sh.getName(),
+      settlementId: String(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.settlementId, hm, '') || ''),
+      month: toMonthText_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.month, hm, '')),
+      operation: 'applyRowCheckAtRow_',
+      message: 'Skipped row check: required reconciliation headers not found.',
+      affectedRows: 1
+    });
+    return;
+  }
+
+  const grossSalesC = hasSalesGross
+    ? toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.salesGross, hm, 0))
+    : (toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.salesNet, hm, 0)) + toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.vatDebito, hm, 0)));
+  const otherC = toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.otherNet, hm, 0));
+  const feesC = toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.feesCost, hm, 0));
+  const transferC = toCents_(safeGetSingleCellByHeader_(sh, r, CONFIG.HEADERS.transfer, hm, 0));
+
+  const diffC = (grossSalesC + otherC - feesC) - transferC;
+  const status = Math.abs(diffC) <= 1 ? 'OK' : ('WARN: mismatch (' + fromCents_(diffC).toFixed(2) + ')');
+  safeSetSingleCellByHeader_(sh, r, CONFIG.HEADERS.rowCheck, status, hm);
 }
 
 /* =========================
@@ -2066,6 +2118,10 @@ function normalizeAmountDescriptionKey_(value) {
     .replace(/[^a-z0-9]/g, '');
 }
 
+function normalizeAmountDescription_(value) {
+  return normalizeAmountDescriptionKey_(value);
+}
+
 function classifyItemPriceComponent_(amountDescription) {
   const key = normalizeAmountDescriptionKey_(amountDescription);
   if (!key) return { isTax: false, isUnknown: true, key: key };
@@ -2090,18 +2146,115 @@ function classifyItemPriceComponent_(amountDescription) {
 }
 
 function classifyItemFeesComponent_(amountDescription) {
-  const key = normalizeAmountDescriptionKey_(amountDescription);
-  if (!key) return { isUnknown: true, key: key };
-  const known = {
-    fbaperunitfulfillmentfee: true,
-    commission: true,
-    shippingchargeback: true,
-    digitalservicesfee: true,
-    fixedclosingfee: true,
-    variableclosingfee: true,
-    refundcommission: true
+  return classifyItemFeeByDescription_(amountDescription);
+}
+
+function createItemFeeMetricsBucket_() {
+  return {
+    totalRows: 0,
+    unknownRows: 0,
+    unknownByDescription: Object.create(null),
+    ambiguousClassCounts: Object.create(null),
+    categoryTotalsC: Object.create(null)
   };
-  return { isUnknown: !known[key], key: key };
+}
+
+function classifyItemFeeByDescription_(amountDescription) {
+  const raw = String(amountDescription || '').trim();
+  const key = normalizeAmountDescription_(raw);
+  if (!key) {
+    return { key: key, sourceDescription: raw, category: 'unknown', subcategory: 'empty', isUnknown: true, fallbackBucket: 'Інші коригування' };
+  }
+
+  const dictionary = {
+    commission: { category: 'referral_commission', subcategory: 'commission' },
+    refundcommission: { category: 'refund_related', subcategory: 'refund_commission_reversal' },
+    fbaperunitfulfillmentfee: { category: 'fulfillment_fee', subcategory: 'fba_per_unit' },
+    variableclosingfee: { category: 'referral_commission', subcategory: 'variable_closing' },
+    fixedclosingfee: { category: 'referral_commission', subcategory: 'fixed_closing' },
+    digitalservicesfee: { category: 'service_fee', subcategory: 'digital_services' },
+    shippingchargeback: { category: 'shipping_fee', subcategory: 'shipping_chargeback' },
+    giftwrapchargeback: { category: 'giftwrap_fee', subcategory: 'giftwrap_chargeback' },
+    giftwrapcommission: { category: 'giftwrap_fee', subcategory: 'giftwrap_commission' },
+    giftwraprefundcommission: { category: 'giftwrap_fee', subcategory: 'giftwrap_refund_commission' },
+    fbarefundfulfillmentfee: { category: 'refund_related', subcategory: 'fba_refund_fee_reversal' },
+    fbainventoryplacementservicefee: { category: 'service_fee', subcategory: 'inventory_placement' }
+  };
+
+  if (dictionary[key]) {
+    return {
+      key: key,
+      sourceDescription: raw,
+      category: dictionary[key].category,
+      subcategory: dictionary[key].subcategory,
+      isUnknown: false,
+      fallbackBucket: dictionary[key].category === 'unknown' ? 'Інші коригування' : ''
+    };
+  }
+
+  if (key.indexOf('giftwrap') !== -1 && key.indexOf('chargeback') !== -1) {
+    return { key: key, sourceDescription: raw, category: 'giftwrap_fee', subcategory: 'giftwrap_chargeback_variant', isUnknown: false, fallbackBucket: '' };
+  }
+  if (key.indexOf('chargeback') !== -1 || key.indexOf('reversal') !== -1) {
+    return { key: key, sourceDescription: raw, category: 'reversal_adjustment', subcategory: 'chargeback_or_reversal', isUnknown: false, fallbackBucket: 'Інші коригування' };
+  }
+  if (key.indexOf('shipping') !== -1) {
+    return { key: key, sourceDescription: raw, category: 'shipping_fee', subcategory: 'shipping_variant', isUnknown: false, fallbackBucket: '' };
+  }
+  if (key.indexOf('refund') !== -1) {
+    return { key: key, sourceDescription: raw, category: 'refund_related', subcategory: 'refund_variant', isUnknown: false, fallbackBucket: '' };
+  }
+  if (key.indexOf('commission') !== -1 || key.indexOf('referral') !== -1) {
+    return { key: key, sourceDescription: raw, category: 'referral_commission', subcategory: 'commission_variant', isUnknown: false, fallbackBucket: '' };
+  }
+
+  return { key: key, sourceDescription: raw, category: 'unknown', subcategory: 'unmapped', isUnknown: true, fallbackBucket: 'Інші коригування' };
+}
+
+function classifyItemFeeRow_(row, idx) {
+  const amountDescription = cellByHeader_(row, idx, 'amount-description');
+  return classifyItemFeeByDescription_(amountDescription);
+}
+
+function determineItemFeeVatTreatment_(row, idx, feeClass) {
+  const marker = detectExplicitFeeVatMarker_(row, idx);
+  if (marker.explicit) {
+    return { treatment: marker.hasVat ? 'included' : 'excluded', reason: marker.reason, rate: marker.rate || 0.22 };
+  }
+
+  const cat = String((feeClass && feeClass.category) || '');
+  if (cat === 'referral_commission' || cat === 'fulfillment_fee' || cat === 'service_fee' || cat === 'shipping_fee') {
+    return { treatment: 'included', reason: 'category-included', rate: 0.22 };
+  }
+  if (cat === 'refund_related' || cat === 'giftwrap_fee' || cat === 'reversal_adjustment') {
+    return { treatment: 'excluded', reason: 'category-excluded', rate: 0.22 };
+  }
+  if (cat === 'unknown') return { treatment: 'ambiguous', reason: 'unknown-category', rate: 0.22 };
+  return { treatment: 'ambiguous', reason: 'unmapped-category', rate: 0.22 };
+}
+
+function accumulateItemFeeMetrics_(bucket, row, feeClass, vatClass, amountC) {
+  if (!bucket) return;
+  bucket.totalRows += 1;
+  const category = (feeClass && feeClass.category) ? feeClass.category : 'unknown';
+  bucket.categoryTotalsC[category] = (bucket.categoryTotalsC[category] || 0) + Number(amountC || 0);
+
+  if (feeClass && feeClass.isUnknown) bucket.unknownRows += 1;
+  if (vatClass && vatClass.treatment === 'ambiguous') {
+    bucket.ambiguousClassCounts[category] = (bucket.ambiguousClassCounts[category] || 0) + 1;
+  }
+}
+
+function buildItemFeeWarningSummary_(settlementId, monthKey, metrics) {
+  if (!metrics) return '';
+  const ambiguousTotal = Object.keys(metrics.ambiguousClassCounts).reduce(function(acc, k) {
+    return acc + Number(metrics.ambiguousClassCounts[k] || 0);
+  }, 0);
+  if (ambiguousTotal <= 0) return '';
+  const classes = Object.keys(metrics.ambiguousClassCounts).map(function(k) {
+    return k + ':' + metrics.ambiguousClassCounts[k];
+  }).join(', ');
+  return '[WARN] Ambiguous VAT treatment in ItemFees for ' + settlementId + ' month ' + monthKey + ': rows=' + ambiguousTotal + '; classes=' + classes;
 }
 
 
@@ -2109,13 +2262,8 @@ function classifyFeeVatTreatment_(row, idx, amountType, amountDescription, trans
   const t = String(amountType || '').trim();
   if (t !== 'ItemFees') return { treatment: 'not_applicable', reason: 'not_item_fees', rate: 0.22 };
 
-  const marker = detectExplicitFeeVatMarker_(row, idx);
-  if (marker.explicit) {
-    return { treatment: marker.hasVat ? 'included' : 'excluded', reason: marker.reason, rate: marker.rate || 0.22 };
-  }
-
-  const descRule = classifyFeeVatByDescription_(amountDescription, transactionType);
-  return { treatment: descRule.treatment, reason: descRule.reason, rate: descRule.rate || 0.22 };
+  const feeClass = classifyItemFeeByDescription_(amountDescription);
+  return determineItemFeeVatTreatment_(row, idx, feeClass);
 }
 
 function detectExplicitFeeVatMarker_(row, idx) {
@@ -2329,6 +2477,64 @@ function findColumnByHeader_(sheet, headerName) {
   if (!sheet || !headerName) return 0;
   const hm = getHeaderMap_(sheet);
   return Number(hm[String(headerName).trim()] || 0);
+}
+
+function findRequiredColumnOrNull_(sheet, headerName, headerMap) {
+  if (!sheet || !headerName) return null;
+  const hm = headerMap || getHeaderMap_(sheet);
+  const col = Number(hm[String(headerName).trim()] || 0);
+  return col > 0 ? col : null;
+}
+
+function hasAllRequiredHeaders_(sheet, headerNames, headerMap) {
+  if (!sheet) return false;
+  const hm = headerMap || getHeaderMap_(sheet);
+  const req = Array.isArray(headerNames) ? headerNames : [];
+  for (let i = 0; i < req.length; i++) {
+    if (!findRequiredColumnOrNull_(sheet, req[i], hm)) return false;
+  }
+  return true;
+}
+
+function safeGetSingleCellByHeader_(sheet, rowIndex, headerName, headerMap, fallbackValue) {
+  if (!sheet || !rowIndex || rowIndex < 1 || !headerName) return fallbackValue;
+  const col = findRequiredColumnOrNull_(sheet, headerName, headerMap);
+  if (!col) return fallbackValue;
+  try {
+    return sheet.getRange(rowIndex, col, 1, 1).getValue();
+  } catch (e) {
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      warningType: 'SAFE_GET_BY_HEADER_FAILED',
+      sheetName: sheet.getName(),
+      headerName: headerName,
+      operation: 'safeGetSingleCellByHeader_',
+      message: toErrorMessage_(e),
+      affectedRows: 1
+    });
+    return fallbackValue;
+  }
+}
+
+function safeSetSingleCellByHeader_(sheet, rowIndex, headerName, value, headerMap) {
+  if (!sheet || !rowIndex || rowIndex < 1 || !headerName) return false;
+  const col = findRequiredColumnOrNull_(sheet, headerName, headerMap);
+  if (!col) return false;
+  try {
+    sheet.getRange(rowIndex, col, 1, 1).setValue(value);
+    return true;
+  } catch (e) {
+    appendDiagnosticsLog_({
+      level: 'WARN',
+      warningType: 'SAFE_SET_BY_HEADER_FAILED',
+      sheetName: sheet.getName(),
+      headerName: headerName,
+      operation: 'safeSetSingleCellByHeader_',
+      message: toErrorMessage_(e),
+      affectedRows: 1
+    });
+    return false;
+  }
 }
 
 function safeRunSheetMutation_(label, fn) {
@@ -2839,15 +3045,25 @@ function appendDiagnosticsLog_(entry) {
     if (!ss) return;
     let sh = ss.getSheetByName(CONFIG.DIAGNOSTICS_SHEET);
     if (!sh) sh = ss.insertSheet(CONFIG.DIAGNOSTICS_SHEET);
+    const header = ['timestamp', 'level', 'settlement_id', 'month', 'warning_type', 'sheet', 'header', 'operation', 'affected_rows', 'message'];
     if (sh.getLastRow() < 1) {
-      sh.getRange(1, 1, 1, 6).setValues([['timestamp', 'sheet', 'header', 'operation', 'reason', 'message']]);
+      sh.getRange(1, 1, 1, header.length).setValues([header]);
+    } else {
+      const existing = sh.getRange(1, 1, 1, Math.max(header.length, sh.getLastColumn())).getValues()[0].map(function(v) { return String(v || '').trim(); });
+      if (existing[0] !== 'timestamp' || existing.indexOf('warning_type') === -1) {
+        sh.getRange(1, 1, 1, header.length).setValues([header]);
+      }
     }
     const row = [
       Utilities.formatDate(new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss'),
+      entry.level || 'INFO',
+      entry.settlementId || '',
+      entry.month || '',
+      entry.warningType || entry.reason || '',
       entry.sheetName || '',
       entry.headerName || '',
       entry.operation || '',
-      entry.reason || '',
+      entry.affectedRows || '',
       entry.message || ''
     ];
     sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setValues([row]);
