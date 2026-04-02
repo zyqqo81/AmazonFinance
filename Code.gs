@@ -725,10 +725,13 @@ function importSettlementTxtFile_(fileId, options) {
 
   const parsed = parseSettlementTsv_(content, costMap, fileMeta, warnings);
   const importedAt = new Date();
-  const rowIndexes = [];
+  let rowIndexes = [];
 
   if (!options.auditOnly) {
     const advancedSheet = ensureAdvancedAnalyticsSheet_();
+    const summaryObjects = [];
+    const advancedObjects = [];
+
     for (let b = 0; b < parsed.summaryRows.length; b++) {
       const rowData = parsed.summaryRows[b].rowData;
       rowData[CONFIG.HEADERS.fileName] = fileName;
@@ -736,15 +739,32 @@ function importSettlementTxtFile_(fileId, options) {
       rowData[CONFIG.HEADERS.importedAt] = importedAt;
       rowData[CONFIG.HEADERS.auditStatus] = 'START';
       rowData[CONFIG.HEADERS.auditUrl] = '';
-
-      const rowValues = buildRowFromHeaderMap_(hm, rowData);
-      const rowIndex = findOrCreateRowBySettlementMonth_(sh, hm, fileId, parsed.settlementId, parsed.summaryRows[b].monthKey);
-      sh.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
-      rowIndexes.push(rowIndex);
-      safeRunSheetMutation_('upsertAdvancedAnalyticsRow_', function() {
-        upsertAdvancedAnalyticsRow_(advancedSheet, rowData);
-      });
+      summaryObjects.push(rowData);
+      advancedObjects.push(rowData);
     }
+
+    const summaryKeys = [CONFIG.HEADERS.fileId, CONFIG.HEADERS.settlementId, CONFIG.HEADERS.month];
+    const summaryUpsertStats = upsertRowsByKey_(sh, summaryKeys, summaryObjects, {});
+    dedupeSheetByKey_(sh, summaryKeys, {});
+
+    const advancedKeys = [CONFIG.HEADERS.fileId, CONFIG.HEADERS.settlementId, CONFIG.HEADERS.month];
+    upsertRowsByKey_(advancedSheet, advancedKeys, advancedObjects, {});
+    dedupeSheetByKey_(advancedSheet, advancedKeys, {});
+
+    const indexAfterUpsert = buildSheetKeyIndex_(sh, summaryKeys);
+    rowIndexes = summaryObjects.map(function(obj) {
+      const key = buildIncomingRowKey_(obj, summaryKeys);
+      return indexAfterUpsert[key] || 0;
+    }).filter(function(v) { return v > 0; });
+
+    appendDiagnosticsLog_({
+      level: 'INFO',
+      operation: 'importSettlementTxtFile_.upsert',
+      sheetName: CONFIG.SUMMARY_SHEET,
+      warningType: 'UPSERT',
+      affectedRows: summaryObjects.length,
+      message: 'Inserted=' + summaryUpsertStats.inserted + ', Updated=' + summaryUpsertStats.updated + ', RemovedDuplicates=' + summaryUpsertStats.removedDuplicates
+    });
 
     runNonCritical_('formatSummaryRows_', function() {
       for (let i = 0; i < rowIndexes.length; i++) formatSummaryRow_(sh, hm, rowIndexes[i], warnings);
@@ -1377,6 +1397,16 @@ function rebuildMonthly_(warnings) {
     rebuildMonthlyVatPayoutSummary_();
   }, warnings);
 
+  runNonCritical_('safeApplyMonthlyLayout_', function() {
+    safeApplyMonthlyLayout_(getMonthlyVatPayoutSheet_());
+    safeApplyMonthlyFormatting_(getMonthlyVatPayoutSheet_());
+  }, warnings);
+
+  runNonCritical_('summary.totals.dedupe', function() {
+    const summarySheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
+    if (summarySheet) updateFilteredTotalsRow_(summarySheet, { label: 'TOTAL (filtered)' });
+  }, warnings);
+
   migrateLegacyMonthlySheetToMain_();
 }
 
@@ -1520,6 +1550,7 @@ function ensureMonthAndTotals_(warnings) {
   }
 
   applyRowCheckAll_();
+  updateFilteredTotalsRow_(sh, { label: "TOTAL (filtered)" });
 }
 
 function applyRowCheckAll_() {
@@ -1929,10 +1960,15 @@ function enforceSummarySchemaLayout_(sheet, requiredHeaders) {
 
   const requiredLen = requiredHeaders.length;
   const totalCols = sheet.getLastColumn();
-  if (requiredLen > 0) sheet.showColumns(1, requiredLen);
+  if (requiredLen > 0) {
+    const showCount = Math.min(requiredLen, Math.max(totalCols, requiredLen));
+    if (showCount > 0) {
+      try { sheet.showColumns(1, showCount); } catch (e) {}
+    }
+  }
   if (totalCols > requiredLen) {
     for (let col = requiredLen + 1; col <= totalCols; col++) {
-      sheet.hideColumns(col);
+      try { sheet.hideColumns(col); } catch (e) {}
     }
   }
 }
@@ -3037,6 +3073,234 @@ function getDataRowCountForColumn_(sheet, col, options) {
   const lastRow = sheet.getLastRow();
   if (lastRow < startRow) return 0;
   return lastRow - startRow + 1;
+}
+
+function normalizeKeyPart_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'");
+  if (value === null || value === undefined) return '';
+  return String(value).trim().replace(/\s+/g, ' ');
+}
+
+function makeStableCompositeKey_(parts) {
+  return (parts || []).map(normalizeKeyPart_).join('||');
+}
+
+function safeFindColumnIndex_(sheet, headerName) {
+  if (!sheet || !headerName || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) return 0;
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const target = normalizeHeaderKey_(headerName);
+  for (let i = 0; i < headers.length; i++) {
+    if (normalizeHeaderKey_(headers[i]) === target) return i + 1;
+  }
+  return 0;
+}
+
+function safeAutoResizeColumnByHeader_(sheet, headerName) {
+  const col = safeFindColumnIndex_(sheet, headerName);
+  if (!col) return false;
+  try { sheet.autoResizeColumn(col); return true; } catch (e) { return false; }
+}
+
+function safeSetColumnWidthByHeader_(sheet, headerName, width) {
+  const col = safeFindColumnIndex_(sheet, headerName);
+  if (!col) return false;
+  try { sheet.setColumnWidth(col, Number(width) || 120); return true; } catch (e) { return false; }
+}
+
+function safeHideColumnByHeader_(sheet, headerName) {
+  const col = safeFindColumnIndex_(sheet, headerName);
+  if (!col) return false;
+  try { sheet.hideColumns(col); return true; } catch (e) { return false; }
+}
+
+function safeShowColumnByHeader_(sheet, headerName) {
+  const col = safeFindColumnIndex_(sheet, headerName);
+  if (!col) return false;
+  try { sheet.showColumns(col); return true; } catch (e) { return false; }
+}
+
+function safeApplyMonthlyLayout_(sheet) {
+  if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) return;
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  for (let i = 0; i < headers.length; i++) {
+    const header = headers[i];
+    if (!header) continue;
+    safeAutoResizeColumnByHeader_(sheet, header);
+  }
+}
+
+function safeApplyMonthlyFormatting_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return;
+  const monthCol = safeFindColumnIndex_(sheet, 'Місяць');
+  if (monthCol) safeSetNumberFormat_(sheet.getRange(2, monthCol, sheet.getLastRow() - 1, 1), '@', [], 'monthly.safe.month');
+}
+
+function buildSheetKeyIndex_(sheet, keyHeaders, options) {
+  options = options || {};
+  const out = {};
+  if (!sheet || sheet.getLastRow() < 2) return out;
+  const hm = getHeaderMap_(sheet);
+  const cols = (keyHeaders || []).map(function(h) { return hm[h] || 0; });
+  if (!cols.length || cols.some(function(c) { return !c; })) return out;
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const parts = cols.map(function(c) { return row[c - 1]; });
+    const key = makeStableCompositeKey_(parts);
+    if (!key || key === '||') continue;
+    if (out[key] === undefined) out[key] = i + 2;
+    else if (options.collectDuplicates) {
+      if (!out.__dups) out.__dups = {};
+      if (!out.__dups[key]) out.__dups[key] = [];
+      out.__dups[key].push(i + 2);
+    }
+  }
+  return out;
+}
+
+function buildIncomingRowKey_(rowObj, keyHeaders) {
+  if (!rowObj) return '';
+  return makeStableCompositeKey_((keyHeaders || []).map(function(h) { return rowObj[h]; }));
+}
+
+function upsertRowsByKey_(sheet, keyHeaders, rowObjects, options) {
+  options = options || {};
+  if (!sheet || !rowObjects || !rowObjects.length) return { inserted: 0, updated: 0, skipped: 0 };
+  const hm = getHeaderMap_(sheet);
+  const index = buildSheetKeyIndex_(sheet, keyHeaders, { collectDuplicates: true });
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < rowObjects.length; i++) {
+    const rowObj = rowObjects[i];
+    const key = buildIncomingRowKey_(rowObj, keyHeaders);
+    if (!key || key.replace(/\|/g, '') === '') { skipped++; continue; }
+    const rowValues = buildRowFromHeaderMap_(hm, rowObj);
+    const existingRow = index[key];
+    if (existingRow) {
+      sheet.getRange(existingRow, 1, 1, rowValues.length).setValues([rowValues]);
+      updated++;
+    } else {
+      const targetRow = Math.max(2, sheet.getLastRow() + 1);
+      sheet.getRange(targetRow, 1, 1, rowValues.length).setValues([rowValues]);
+      index[key] = targetRow;
+      inserted++;
+    }
+  }
+
+  const removed = dedupeSheetByKey_(sheet, keyHeaders, options);
+  return { inserted: inserted, updated: updated, skipped: skipped, removedDuplicates: removed };
+}
+
+function dedupeSheetByKey_(sheet, keyHeaders, options) {
+  options = options || {};
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  const hm = getHeaderMap_(sheet);
+  const cols = (keyHeaders || []).map(function(h) { return hm[h] || 0; });
+  if (!cols.length || cols.some(function(c) { return !c; })) return 0;
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const seen = {};
+  const keep = [];
+  let removed = 0;
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const key = makeStableCompositeKey_(cols.map(function(c) { return row[c - 1]; }));
+    if (!key || key.replace(/\|/g, '') === '') { keep.push(row); continue; }
+    if (seen[key]) { removed++; continue; }
+    seen[key] = true;
+    keep.push(row);
+  }
+  if (removed > 0) {
+    clearManagedBodyPreserveHeader_(sheet);
+    if (keep.length) sheet.getRange(2, 1, keep.length, sheet.getLastColumn()).setValues(keep);
+    appendDiagnosticsLog_({
+      level: 'INFO',
+      operation: 'dedupeSheetByKey_',
+      sheetName: sheet.getName(),
+      warningType: 'DEDUPE',
+      affectedRows: removed,
+      message: 'Removed duplicate rows by key: ' + keyHeaders.join(', ')
+    });
+  }
+  return removed;
+}
+
+function getHeaderRowIndex_(sheet) { return 1; }
+function getDataStartRow_(sheet) { return getHeaderRowIndex_(sheet) + 1; }
+function getLastDataRow_(sheet) { return sheet ? Math.max(getDataStartRow_(sheet) - 1, sheet.getLastRow()) : 0; }
+
+function clearManagedBodyPreserveHeader_(sheet) {
+  if (!sheet) return;
+  const start = getDataStartRow_(sheet);
+  const last = sheet.getLastRow();
+  if (last >= start) sheet.getRange(start, 1, last - start + 1, Math.max(1, sheet.getLastColumn())).clearContent();
+}
+
+function writeManagedBody_(sheet, headers, values, options) {
+  options = options || {};
+  if (!sheet) return;
+  if (headers && headers.length) sheet.getRange(getHeaderRowIndex_(sheet), 1, 1, headers.length).setValues([headers]);
+  clearManagedBodyPreserveHeader_(sheet);
+  if (values && values.length) sheet.getRange(getDataStartRow_(sheet), 1, values.length, values[0].length).setValues(values);
+}
+
+function replaceManagedSheetBody_(sheet, headers, rows, options) {
+  writeManagedBody_(sheet, headers, rows, options || {});
+}
+
+function rebuildManagedSheet_(sheet, headers, rowObjects, options) {
+  const hm = {};
+  (headers || []).forEach(function(h, i) { hm[h] = i + 1; });
+  const values = (rowObjects || []).map(function(obj) { return buildRowFromHeaderMap_(hm, obj); });
+  writeManagedBody_(sheet, headers, values, options || {});
+}
+
+function findOrCreateTotalsRow_(sheet, label) {
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  const lookFor = String(label || 'TOTAL (filtered)').trim();
+  const all = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (let i = 0; i < all.length; i++) {
+    for (let c = 0; c < all[i].length; c++) {
+      if (String(all[i][c] || '').trim() === lookFor) return i + 2;
+    }
+  }
+  return sheet.getLastRow() + 1;
+}
+
+function isTotalsRow_(rowValues) {
+  if (!rowValues || !rowValues.length) return false;
+  for (let i = 0; i < rowValues.length; i++) {
+    if (String(rowValues[i] || '').trim() === 'TOTAL (filtered)') return true;
+  }
+  return false;
+}
+
+function removeDuplicateTotalsRows_(sheet, label) {
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  const target = String(label || 'TOTAL (filtered)').trim();
+  const all = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const keep = [];
+  let found = false;
+  let removed = 0;
+  for (let i = 0; i < all.length; i++) {
+    const isTarget = all[i].some(function(v) { return String(v || '').trim() === target; });
+    if (isTarget) {
+      if (found) { removed++; continue; }
+      found = true;
+    }
+    keep.push(all[i]);
+  }
+  if (removed > 0) {
+    clearManagedBodyPreserveHeader_(sheet);
+    if (keep.length) sheet.getRange(2, 1, keep.length, sheet.getLastColumn()).setValues(keep);
+  }
+  return removed;
+}
+
+function updateFilteredTotalsRow_(sheet, config) {
+  if (!sheet) return;
+  removeDuplicateTotalsRows_(sheet, (config && config.label) || 'TOTAL (filtered)');
 }
 
 function appendDiagnosticsLog_(entry) {
@@ -4366,7 +4630,7 @@ function importSingleSalesTaxFile_(file, options) {
     rows.push(sourceHeaders.map(function(_, idx) { return srcRow[idx] === undefined ? '' : srcRow[idx]; }).concat(ext));
   }
 
-  appendSalesTaxRawRows_(sourceHeaders, rows);
+  upsertSalesTaxRawRows_(sourceHeaders, rows, fileId);
   return { fileId: fileId, fileName: fileName, rows: rows.length };
 }
 
@@ -4532,8 +4796,96 @@ function importSalesTaxReportCsvFile_(fileId, fileNameHint) {
 }
 
 function upsertSalesTaxRawRows_(sourceHeaders, newRows, fileId) {
-  deleteSalesTaxRowsByFileId_(fileId);
-  appendSalesTaxRawRows_(sourceHeaders, newRows);
+  const sh = getOrCreateSheet_(CONFIG.SALES_TAX_RAW_SHEET);
+  const finalHeaders = sourceHeaders.concat(SALES_TAX_COMPUTED_HEADERS);
+  const lastRow = sh.getLastRow();
+
+  if (lastRow < 1) {
+    sh.getRange(1, 1, 1, finalHeaders.length).setValues([finalHeaders]);
+  } else {
+    const existingHeaders = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+    const missing = [];
+    for (let i = 0; i < finalHeaders.length; i++) {
+      if (existingHeaders.indexOf(finalHeaders[i]) === -1) missing.push(finalHeaders[i]);
+    }
+    if (missing.length) {
+      const merged = existingHeaders.concat(missing);
+      const data = lastRow > 1 ? sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues() : [];
+      sh.clearContents();
+      sh.getRange(1, 1, 1, merged.length).setValues([merged]);
+      if (data.length) {
+        const migrated = data.map(function(r) { return realignRowByHeaders_(existingHeaders, r, merged); });
+        sh.getRange(2, 1, migrated.length, merged.length).setValues(migrated);
+      }
+    }
+  }
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const idxImportFileId = hm[normalizeHeaderKey_('Import File ID')];
+  const idxSourceHash = hm[normalizeHeaderKey_('Source Row Hash')];
+  const idxFallbackOrder = hm[normalizeHeaderKey_('Order ID')];
+  const idxFallbackSku = hm[normalizeHeaderKey_('SKU')];
+  const idxFallbackDate = hm[normalizeHeaderKey_('Tax Calculation Date')];
+
+  const existingIndex = {};
+  if (sh.getLastRow() >= 2) {
+    const existingRows = sh.getRange(2, 1, sh.getLastRow() - 1, headers.length).getValues();
+    for (let i = 0; i < existingRows.length; i++) {
+      const row = existingRows[i];
+      const hashKey = makeStableCompositeKey_([
+        idxImportFileId === undefined ? '' : row[idxImportFileId],
+        idxSourceHash === undefined ? '' : row[idxSourceHash]
+      ]);
+      const fallbackKey = makeStableCompositeKey_([
+        idxImportFileId === undefined ? '' : row[idxImportFileId],
+        idxFallbackOrder === undefined ? '' : row[idxFallbackOrder],
+        idxFallbackDate === undefined ? '' : row[idxFallbackDate],
+        idxFallbackSku === undefined ? '' : row[idxFallbackSku]
+      ]);
+      const key = (hashKey && hashKey !== '||') ? hashKey : fallbackKey;
+      if (key && key.replace(/\|/g, '') !== '' && existingIndex[key] === undefined) existingIndex[key] = i + 2;
+    }
+  }
+
+  let inserted = 0;
+  let updated = 0;
+  const alignedRows = (newRows || []).map(function(r) { return realignRowByHeaders_(finalHeaders, r, headers); });
+  for (let i = 0; i < alignedRows.length; i++) {
+    const row = alignedRows[i];
+    const hashKey = makeStableCompositeKey_([
+      idxImportFileId === undefined ? fileId : row[idxImportFileId],
+      idxSourceHash === undefined ? '' : row[idxSourceHash]
+    ]);
+    const fallbackKey = makeStableCompositeKey_([
+      idxImportFileId === undefined ? fileId : row[idxImportFileId],
+      idxFallbackOrder === undefined ? '' : row[idxFallbackOrder],
+      idxFallbackDate === undefined ? '' : row[idxFallbackDate],
+      idxFallbackSku === undefined ? '' : row[idxFallbackSku]
+    ]);
+    const key = (hashKey && hashKey !== '||') ? hashKey : fallbackKey;
+
+    if (key && existingIndex[key]) {
+      sh.getRange(existingIndex[key], 1, 1, headers.length).setValues([row]);
+      updated++;
+    } else {
+      const targetRow = Math.max(2, sh.getLastRow() + 1);
+      sh.getRange(targetRow, 1, 1, headers.length).setValues([row]);
+      if (key) existingIndex[key] = targetRow;
+      inserted++;
+    }
+  }
+
+  const removed = dedupeSheetByKey_(sh, ['Import File ID', 'Source Row Hash'], {});
+  applySalesTaxRawFormats_(sh, Math.max(0, sh.getLastRow() - 1), sourceHeaders.length, SALES_TAX_COMPUTED_HEADERS.length);
+  appendDiagnosticsLog_({
+    level: 'INFO',
+    operation: 'upsertSalesTaxRawRows_',
+    sheetName: CONFIG.SALES_TAX_RAW_SHEET,
+    warningType: 'UPSERT',
+    affectedRows: alignedRows.length,
+    message: 'fileId=' + fileId + '; inserted=' + inserted + '; updated=' + updated + '; removedDuplicates=' + removed
+  });
 }
 
 function realignRowByHeaders_(existingHeaders, row, targetHeaders) {
