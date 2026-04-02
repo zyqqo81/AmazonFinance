@@ -6283,6 +6283,27 @@ function getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth) {
   return roundMoney_(((manualExpenseVatByMonth || {})[month] || { vat: 0 }).vat || 0);
 }
 
+function sumMonthlyAmazonFeeVat_(settlementFlowByMonth, month) {
+  const flow = (settlementFlowByMonth || {})[month] || {};
+  return roundMoney_(flow.feeVat || 0);
+}
+
+function buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth) {
+  const sales = (salesAgg || {})[month] || {};
+  const salesVat = roundMoney_(sales.vatPayable || 0);
+  const feeVat = sumMonthlyAmazonFeeVat_(settlementFlowByMonth, month);
+  const expenseVat = roundMoney_(getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {}));
+  const vatCredit = roundMoney_(feeVat + expenseVat);
+  const vatToPay = roundMoney_(salesVat - vatCredit);
+  return {
+    salesVat: salesVat,
+    feeVat: feeVat,
+    expenseVat: expenseVat,
+    vatCredit: vatCredit,
+    vatToPay: vatToPay
+  };
+}
+
 function getPaidVatBreakdownForMonth_(month, manualVatByMonth, manualExpenseVatByMonth, amazonFeeVat) {
   const manualInputVat = roundMoney_(((manualVatByMonth || {})[month] || { paidVat: 0 }).paidVat || 0);
   const manualExpenseVat = getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {});
@@ -6360,12 +6381,16 @@ function syncManualPurchasesToZakupky_() {
 }
 
 function applyManualExpensesToMonthlyReport_(row, month, manualExpensesByMonth) {
-  const profitBeforeVat = parseNumberFlexible_(row[15]);
-  const paidVat = parseNumberFlexible_(row[12]);
-  const vatToPay = roundMoney_(parseNumberFlexible_(row[3]) - paidVat);
+  const salesVat = roundMoney_(parseNumberFlexible_(row[7]));
+  const feeVat = roundMoney_(parseNumberFlexible_(row[10]));
+  const expenseVat = roundMoney_(parseNumberFlexible_(row[11]));
+  const vatCredit = roundMoney_(feeVat + expenseVat);
+  const vatToPay = roundMoney_(salesVat - vatCredit);
+  const profitBeforeVat = roundMoney_(parseNumberFlexible_(row[14]));
 
+  row[12] = vatCredit;
   row[13] = vatToPay;
-  row[16] = roundMoney_(profitBeforeVat - vatToPay);
+  row[15] = roundMoney_(profitBeforeVat - vatToPay);
   return row;
 }
 
@@ -6497,7 +6522,7 @@ function rebuildLatestMonthOnly_() {
   sh.getRange(2, 1, 1, headers.length).setValues([row]);
   applyMonthlyVatPayoutFormats_(sh, 1);
 
-  return { month: month, paidOut: row[1], vatToPay: row[13], salesFileCount: row[26], settlementCount: row[25] };
+  return { month: month, paidOut: row[1], vatToPay: row[13], settlementCount: row[22], salesFileCount: row[23] };
 }
 
 function rebuildMonthlyVatPayoutSummary_() {
@@ -6581,24 +6606,27 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, 
   };
   const cogs = roundMoney_((cogsByMonth[month] || { cogs: 0 }).cogs);
   const salesNet = roundMoney_(s.salesAmount || 0);
-  const salesVat = roundMoney_(s.vatPayable || 0);
+  const vatMetrics = buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth);
+  const salesVat = vatMetrics.salesVat;
   const salesGross = roundMoney_(s.grossSales || (salesNet + salesVat));
   const hasManualFees = !!manualFeesByMonth[month];
   const fees = roundMoney_(hasManualFees ? manualFeesByMonth[month].fees : flow.fees);
-  const expenseVat = roundMoney_(getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {}));
-  const feeVat = roundMoney_(flow.feeVat || 0);
-  const vatCredit = roundMoney_(feeVat + expenseVat);
-  const vatToPay = roundMoney_(salesVat - vatCredit);
+  const expenseVat = vatMetrics.expenseVat;
+  const feeVat = vatMetrics.feeVat;
+  const vatCredit = vatMetrics.vatCredit;
+  const vatToPay = vatMetrics.vatToPay;
   const settlementProfit = roundMoney_(p.paidOut - cogs);
   const manualExpenses = roundMoney_(((manualExpensesByMonth || {})[month] || { amount: 0 }).amount || 0);
-  const netCash = roundMoney_(settlementProfit - manualExpenses);
-  const profitBeforeVat = settlementProfit;
+  const profitBeforeVat = roundMoney_(settlementProfit - manualExpenses);
+  const cashAfterVat = roundMoney_(profitBeforeVat - vatToPay);
+  const netCash = roundMoney_(profitBeforeVat);
   const settlementCount = Object.keys(p.fileIds || {}).length;
   const salesFileCount = Object.keys(s.fileIds || {}).length;
-  const businessFund = roundMoney_(settlementProfit * 0.12);
-  const salaryFund = roundMoney_(settlementProfit * 0.07);
-  const otherFund = roundMoney_(settlementProfit * 0.06);
-  const reinvestFromProfit = roundMoney_(settlementProfit * 0.75);
+  const fundBase = cashAfterVat;
+  const businessFund = roundMoney_(fundBase * 0.12);
+  const salaryFund = roundMoney_(fundBase * 0.07);
+  const otherFund = roundMoney_(fundBase * 0.06);
+  const reinvestFromProfit = roundMoney_(fundBase * 0.75);
   const fullReinvest = roundMoney_(cogs + reinvestFromProfit);
   const notes =
     (hasManualFees ? 'Комісії: ручне перевизначення. ' : 'Комісії: із settlement. ') +
@@ -6621,7 +6649,7 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, 
     roundMoney_(vatCredit),
     vatToPay,
     roundMoney_(profitBeforeVat),
-    roundMoney_(netCash),
+    roundMoney_(cashAfterVat),
     roundMoney_(businessFund),
     roundMoney_(salaryFund),
     roundMoney_(otherFund),
@@ -6642,64 +6670,103 @@ function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
 }
 
 function buildSettlementFeesByMonth_() {
-  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SUMMARY_SHEET);
-  if (!sh || sh.getLastRow() < 2) return {};
+  const summaryFlow = buildSettlementFlowByMonthFromSheet_(CONFIG.SUMMARY_SHEET);
+  const advancedFlow = buildSettlementFlowByMonthFromSheet_(CONFIG.ADVANCED_ANALYTICS_SHEET);
+  const out = {};
+  const months = mergeMonthKeys_(Object.keys(summaryFlow), Object.keys(advancedFlow));
 
+  for (let i = 0; i < months.length; i++) {
+    const month = months[i];
+    const s = summaryFlow[month] || {};
+    const a = advancedFlow[month] || {};
+    const useAdvancedVat = (a.__rows || 0) > 0 && (a.__hasAmazonFeeVat || false);
+    const useAdvancedFees = (a.__rows || 0) > 0 && (a.__hasFees || false);
+
+    out[month] = {
+      fees: roundMoney_(useAdvancedFees ? (a.fees || 0) : (s.fees || 0)),
+      feeVat: roundMoney_(useAdvancedVat ? (a.feeVat || 0) : (s.feeVat || 0)),
+      salesNet: roundMoney_((a.__hasSalesNet ? a.salesNet : s.salesNet) || 0),
+      salesVat: roundMoney_((a.__hasSalesVat ? a.salesVat : s.salesVat) || 0),
+      salesGross: roundMoney_((a.__hasSalesGross ? a.salesGross : s.salesGross) || 0),
+      credits: roundMoney_((a.__hasCredits ? a.credits : s.credits) || 0),
+      debits: roundMoney_((a.__hasDebits ? a.debits : s.debits) || 0),
+      refunds: roundMoney_((a.__hasRefunds ? a.refunds : s.refunds) || 0),
+      shipping: roundMoney_((a.__hasShipping ? a.shipping : s.shipping) || 0),
+      adjustments: roundMoney_((a.__hasAdjustments ? a.adjustments : s.adjustments) || 0),
+      feeVatDetectedRows: roundMoney_((a.feeVatDetectedRows || s.feeVatDetectedRows || 0)),
+      feeVatAmbiguousRows: roundMoney_((a.feeVatAmbiguousRows || s.feeVatAmbiguousRows || 0)),
+      source: useAdvancedVat ? 'ADVANCED_ANALYTICS' : 'SUMMARY'
+    };
+  }
+
+  return out;
+}
+
+function buildSettlementFlowByMonthFromSheet_(sheetName) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh || sh.getLastRow() < 2) return {};
   const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
   const hm = buildHeaderMapCaseInsensitive_(all[0]);
 
-  function headerIdx_(headerName) {
+  function idxOf_(headerName) {
     return hm[normalizeHeaderKey_(headerName)];
   }
 
-  const idxFees = headerIdx_(CONFIG.HEADERS.feesCost);
-  const idxFeeVat = headerIdx_(CONFIG.HEADERS.amazonFeeVat);
-  const idxSalesNetOnly = headerIdx_(CONFIG.HEADERS.salesNetOnly);
-  const idxSalesVatOnly = headerIdx_(CONFIG.HEADERS.salesVatOnly);
-  const idxSalesGross = headerIdx_(CONFIG.HEADERS.salesGross);
-  const idxCredits = headerIdx_(CONFIG.HEADERS.amazonCredits);
-  const idxDebits = headerIdx_(CONFIG.HEADERS.amazonDebits);
-  const idxRefunds = headerIdx_(CONFIG.HEADERS.refundsTotal);
-  const idxShipping = headerIdx_(CONFIG.HEADERS.shippingTotal);
-  const idxAdjustments = headerIdx_(CONFIG.HEADERS.adjustmentsTotal);
-
+  const idxFees = idxOf_(CONFIG.HEADERS.feesCost);
+  const idxFeeVat = idxOf_(CONFIG.HEADERS.amazonFeeVat);
+  const idxFeeVatDetectedRows = idxOf_(CONFIG.HEADERS.amazonFeeVatDetectedRows);
+  const idxFeeVatAmbiguousRows = idxOf_(CONFIG.HEADERS.amazonFeeVatAmbiguousRows);
+  const idxSalesNetOnly = idxOf_(CONFIG.HEADERS.salesNetOnly);
+  const idxSalesVatOnly = idxOf_(CONFIG.HEADERS.salesVatOnly);
+  const idxSalesGross = idxOf_(CONFIG.HEADERS.salesGross);
+  const idxCredits = idxOf_(CONFIG.HEADERS.amazonCredits);
+  const idxDebits = idxOf_(CONFIG.HEADERS.amazonDebits);
+  const idxRefunds = idxOf_(CONFIG.HEADERS.refundsTotal);
+  const idxShipping = idxOf_(CONFIG.HEADERS.shippingTotal);
+  const idxAdjustments = idxOf_(CONFIG.HEADERS.adjustmentsTotal);
+  const idxMonth = hm[normalizeHeaderKey_(CONFIG.HEADERS.month)];
+  const idxPosted = hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)];
+  const idxDeposit = hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)];
   const out = {};
+
   for (let i = 1; i < all.length; i++) {
     const r = all[i];
     const fid = String(valueByHeader_(r, hm, CONFIG.HEADERS.fileId) || '').trim();
     if (!fid || fid === CONFIG.TOTAL_FILE_ID) continue;
-    const month = monthFromSummaryRow_(r, (hm[normalizeHeaderKey_(CONFIG.HEADERS.month)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.postedDate)] || -1) + 1, (hm[normalizeHeaderKey_(CONFIG.HEADERS.depositDate)] || -1) + 1);
+    const month = monthFromSummaryRow_(r, (idxMonth === undefined ? -1 : idxMonth + 1), (idxPosted === undefined ? -1 : idxPosted + 1), (idxDeposit === undefined ? -1 : idxDeposit + 1));
     if (!month) continue;
-
     if (!out[month]) {
       out[month] = {
-        fees: 0,
-        feeVat: 0,
-        salesNet: 0,
-        salesVat: 0,
-        salesGross: 0,
-        credits: 0,
-        debits: 0,
-        refunds: 0,
-        shipping: 0,
-        adjustments: 0
+        fees: 0, feeVat: 0, salesNet: 0, salesVat: 0, salesGross: 0, credits: 0, debits: 0, refunds: 0, shipping: 0, adjustments: 0,
+        feeVatDetectedRows: 0, feeVatAmbiguousRows: 0,
+        __rows: 0,
+        __hasFees: idxFees !== undefined,
+        __hasAmazonFeeVat: idxFeeVat !== undefined,
+        __hasSalesNet: idxSalesNetOnly !== undefined || hm[normalizeHeaderKey_(CONFIG.HEADERS.salesNet)] !== undefined,
+        __hasSalesVat: idxSalesVatOnly !== undefined || hm[normalizeHeaderKey_(CONFIG.HEADERS.vatDebito)] !== undefined,
+        __hasSalesGross: idxSalesGross !== undefined,
+        __hasCredits: idxCredits !== undefined,
+        __hasDebits: idxDebits !== undefined,
+        __hasRefunds: idxRefunds !== undefined,
+        __hasShipping: idxShipping !== undefined,
+        __hasAdjustments: idxAdjustments !== undefined || hm[normalizeHeaderKey_(CONFIG.HEADERS.otherNet)] !== undefined
       };
     }
-
-    out[month].fees += idxFees === undefined ? 0 : parseNumberFlexible_(r[idxFees]);
-    out[month].feeVat += idxFeeVat === undefined ? 0 : parseNumberFlexible_(r[idxFeeVat]);
-    out[month].salesNet += idxSalesNetOnly === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.salesNet)) : parseNumberFlexible_(r[idxSalesNetOnly]);
-    out[month].salesVat += idxSalesVatOnly === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.vatDebito)) : parseNumberFlexible_(r[idxSalesVatOnly]);
-    out[month].salesGross += idxSalesGross === undefined
-      ? (parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.salesNet)) + parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.vatDebito)))
-      : parseNumberFlexible_(r[idxSalesGross]);
-    out[month].credits += idxCredits === undefined ? 0 : parseNumberFlexible_(r[idxCredits]);
-    out[month].debits += idxDebits === undefined ? 0 : parseNumberFlexible_(r[idxDebits]);
-    out[month].refunds += idxRefunds === undefined ? 0 : parseNumberFlexible_(r[idxRefunds]);
-    out[month].shipping += idxShipping === undefined ? 0 : parseNumberFlexible_(r[idxShipping]);
-    out[month].adjustments += idxAdjustments === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.otherNet)) : parseNumberFlexible_(r[idxAdjustments]);
+    const b = out[month];
+    b.__rows += 1;
+    b.fees += idxFees === undefined ? 0 : parseNumberFlexible_(r[idxFees]);
+    b.feeVat += idxFeeVat === undefined ? 0 : parseNumberFlexible_(r[idxFeeVat]);
+    b.feeVatDetectedRows += idxFeeVatDetectedRows === undefined ? 0 : parseNumberFlexible_(r[idxFeeVatDetectedRows]);
+    b.feeVatAmbiguousRows += idxFeeVatAmbiguousRows === undefined ? 0 : parseNumberFlexible_(r[idxFeeVatAmbiguousRows]);
+    b.salesNet += idxSalesNetOnly === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.salesNet)) : parseNumberFlexible_(r[idxSalesNetOnly]);
+    b.salesVat += idxSalesVatOnly === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.vatDebito)) : parseNumberFlexible_(r[idxSalesVatOnly]);
+    b.salesGross += idxSalesGross === undefined ? (parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.salesNet)) + parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.vatDebito))) : parseNumberFlexible_(r[idxSalesGross]);
+    b.credits += idxCredits === undefined ? 0 : parseNumberFlexible_(r[idxCredits]);
+    b.debits += idxDebits === undefined ? 0 : parseNumberFlexible_(r[idxDebits]);
+    b.refunds += idxRefunds === undefined ? 0 : parseNumberFlexible_(r[idxRefunds]);
+    b.shipping += idxShipping === undefined ? 0 : parseNumberFlexible_(r[idxShipping]);
+    b.adjustments += idxAdjustments === undefined ? parseNumberFlexible_(valueByHeader_(r, hm, CONFIG.HEADERS.otherNet)) : parseNumberFlexible_(r[idxAdjustments]);
   }
-
   return out;
 }
 
@@ -6784,6 +6851,7 @@ function writeDiagnostics_() {
   const workingCapitalAgg = collectWorkingCapitalByMonth_();
   const workingCapitalTotals = getWorkingCapitalTotals_(workingCapitalAgg);
   const legacyStatus = inspectLegacyMonthlySheetUsage_();
+  const feeVatBySettlement = buildSettlementVatDiagnosticsByFile_();
 
   rows.push(['INFO', 'A. Імпортовані settlement файли', 'File ID', 'Назва файлу', 'Дата виплати', 'Ефективна posted date', 'Призначений місяць', 'Виплата', 'COGS | Комісії']);
   const settlementFiles = buildSettlementFilesRegistry_();
@@ -6825,11 +6893,20 @@ function writeDiagnostics_() {
     rows.push(['DATA', 'C1. Settlement VAT/flow', km,
       roundMoney_(flow.salesVat || 0),
       roundMoney_(flow.feeVat || 0),
-      '',
+      roundMoney_(flow.feeVatAmbiguousRows || 0),
       roundMoney_(flow.credits || 0),
       roundMoney_(flow.debits || 0),
       'R:' + roundMoney_(flow.refunds || 0) + ' | S:' + roundMoney_(flow.shipping || 0) + ' | A:' + roundMoney_(flow.adjustments || 0)
     ]);
+  }
+
+  rows.push(['INFO', 'C1b. VAT chain by settlement', 'Місяць', 'Settlement ID/File ID', 'Fee rows', 'Determinable fee VAT', 'Ambiguous fee rows', 'VAT до заліку', 'VAT до доплати']);
+  const feeVatKeys = Object.keys(feeVatBySettlement).sort();
+  for (let fk = 0; fk < feeVatKeys.length; fk++) {
+    const key = feeVatKeys[fk];
+    const info = feeVatBySettlement[key] || {};
+    const vatMetrics = buildMonthlyVatMetrics_(info.month, salesAgg, settlementFlow, manualExpenseVat.byMonth);
+    rows.push(['DATA', 'C1b. VAT chain by settlement', info.month, info.settlementRef, info.feeRows, roundMoney_(info.determinableFeeVat || 0), roundMoney_(info.ambiguousRows || 0), vatMetrics.vatCredit, vatMetrics.vatToPay]);
   }
 
   rows.push(['INFO', 'C2. Cashflow totals by month', 'Місяць', 'Виплата Amazon', 'Повернення собівартості', 'Прибуток до НДС', 'НДС до оплати', 'Чистий кеш після НДС', 'Реально вільний кеш']);
@@ -7107,6 +7184,28 @@ function formatDateForDiagnostics_(value) {
   return String(value || '').trim();
 }
 
+function buildSettlementVatDiagnosticsByFile_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.ADVANCED_ANALYTICS_SHEET);
+  if (!sh || sh.getLastRow() < 2) return {};
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const hm = buildHeaderMapCaseInsensitive_(all[0]);
+  const out = {};
+  for (let i = 1; i < all.length; i++) {
+    const row = all[i];
+    const month = toMonthText_(valueByHeader_(row, hm, CONFIG.HEADERS.month) || valueByHeader_(row, hm, CONFIG.HEADERS.postedDate));
+    if (!month) continue;
+    const fileId = String(valueByHeader_(row, hm, CONFIG.HEADERS.fileId) || '').trim();
+    const settlementId = String(valueByHeader_(row, hm, CONFIG.HEADERS.settlementId) || '').trim();
+    if (!fileId && !settlementId) continue;
+    const key = month + '|' + (settlementId || fileId);
+    if (!out[key]) out[key] = { month: month, settlementRef: settlementId || fileId, feeRows: 0, determinableFeeVat: 0, ambiguousRows: 0 };
+    out[key].feeRows += 1;
+    out[key].determinableFeeVat = roundMoney_(out[key].determinableFeeVat + parseNumberFlexible_(valueByHeader_(row, hm, CONFIG.HEADERS.amazonFeeVat)));
+    out[key].ambiguousRows = roundMoney_(out[key].ambiguousRows + parseNumberFlexible_(valueByHeader_(row, hm, CONFIG.HEADERS.amazonFeeVatAmbiguousRows)));
+  }
+  return out;
+}
+
 function arraysEqualByTrim_(a, b) {
   if (!a || !b || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -7195,7 +7294,7 @@ function readMonthlyDashboardRows_(sheet) {
   const idxVatFeeAmazon = pickHeaderIndex_(['ПДВ у комісіях Amazon', 'НДС у комісіях Amazon']);
   const idxVatExpense = pickHeaderIndex_(['ПДВ з витрат']);
   const idxVatCredit = pickHeaderIndex_(['VAT до заліку']);
-  const idxCashAfterVat = pickHeaderIndex_(['Чистий кеш', 'Залишок після НДС']);
+  const idxCashAfterVat = pickHeaderIndex_(['Залишок після НДС', 'Чистий кеш']);
   const idxCredits = pickHeaderIndex_(['Усі зарахування Amazon']);
   const idxDebits = pickHeaderIndex_(['Усі утримання Amazon']);
   const idxRefunds = pickHeaderIndex_(['Повернення / Refunds', 'Повернення / Refund']);
