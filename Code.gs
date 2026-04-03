@@ -7887,6 +7887,174 @@ function arraysEqualByTrim_(a, b) {
   return true;
 }
 
+function readSheetRowsByHeaders_(sheet) {
+  if (!sheet) return { headers: [], rows: [], headerMap: {}, totalRows: 0 };
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return { headers: [], rows: [], headerMap: {}, totalRows: 0 };
+
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = (values[0] || []).map(function(h) { return String(h || '').trim(); });
+  const headerMap = buildHeaderMapCaseInsensitive_(headers);
+  const rows = [];
+
+  for (let i = 1; i < values.length; i++) {
+    const raw = values[i];
+    if (!raw || isEmptyRow_(raw)) continue;
+    const obj = {};
+    for (let c = 0; c < headers.length; c++) {
+      const h = headers[c];
+      if (!h) continue;
+      obj[h] = raw[c];
+    }
+    obj.__rowNumber = i + 1;
+    rows.push(obj);
+  }
+
+  return {
+    headers: headers,
+    rows: rows,
+    headerMap: headerMap,
+    totalRows: rows.length
+  };
+}
+
+function safeParseMonthKey_(value) {
+  return toMonthText_(value);
+}
+
+function safeParseNumber_(value) {
+  return parseNumberFlexible_(value);
+}
+
+function normalizeMonthlyDashboardRow_(row) {
+  const src = row || {};
+  const month = safeParseMonthKey_(
+    safeGetProp_(src, 'Місяць',
+      safeGetProp_(src, 'Month',
+        safeGetProp_(src, 'Period',
+          safeGetProp_(src, 'Період', ''))))
+  );
+
+  function pick_(keys, fallback) {
+    const list = keys || [];
+    for (let i = 0; i < list.length; i++) {
+      const v = safeGetProp_(src, list[i], undefined);
+      if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+    }
+    return fallback;
+  }
+
+  return {
+    month: month,
+    payout: safeParseNumber_(pick_(['Виплата Amazon', 'Amazon Paid Out', 'Paid Out'], 0)),
+    cogs: safeParseNumber_(pick_(['COGS', 'COGS (Last)'], 0)),
+    settlementProfit: safeParseNumber_(pick_(['Чистий прибуток settlement', 'Net Profit Settlement'], 0)),
+    manualExpenses: safeParseNumber_(pick_(['Ручні витрати', 'Manual Expenses'], 0)),
+    netCash: safeParseNumber_(pick_(['Чистий кеш', 'Net Cash'], 0)),
+    turnoverNet: safeParseNumber_(pick_(['Оборот без ПДВ', 'Продажі без ПДВ', 'Net Sales Total', 'Sales Amount'], 0)),
+    vatSales: safeParseNumber_(pick_(['ПДВ з продажів', 'VAT Sales', 'VAT Total', 'VAT Payable'], 0)),
+    turnoverGross: safeParseNumber_(pick_(['Оборот з ПДВ', 'Продажі з ПДВ', 'Gross Sales Total', 'Gross Sales'], 0)),
+    amazonFees: safeParseNumber_(pick_(['Комісії Amazon', 'Amazon Fees'], 0)),
+    vatFeeAmazon: safeParseNumber_(pick_(['ПДВ у комісіях Amazon', 'VAT in Amazon Fees'], 0)),
+    vatExpense: safeParseNumber_(pick_(['ПДВ з витрат', 'Expense VAT'], 0)),
+    vatCredit: safeParseNumber_(pick_(['VAT до заліку', 'VAT Credit'], 0)),
+    vatToPay: safeParseNumber_(pick_(['VAT до доплати', 'VAT Payable'], 0)),
+    profitBeforeVat: safeParseNumber_(pick_(['Прибуток до НДС', 'Profit Before VAT'], 0)),
+    cashAfterVat: safeParseNumber_(pick_(['Залишок після НДС', 'Cash After VAT'], 0)),
+    businessExpenses: safeParseNumber_(pick_(['Бізнес витрати', 'Business Expenses'], 0)),
+    salary: safeParseNumber_(pick_(['Зарплата', 'Salary'], 0)),
+    other: safeParseNumber_(pick_(['Інше', 'Other'], 0)),
+    reinvestFromProfit: safeParseNumber_(pick_(['Реінвест із прибутку', 'Reinvest from Profit'], 0)),
+    fullReinvest: safeParseNumber_(pick_(['Повний фонд реінвесту', 'Full Reinvest Fund'], 0)),
+    rawRowNumber: Number(safeGetProp_(src, '__rowNumber', 0)) || 0
+  };
+}
+
+function isMeaningfulMonthlyDashboardRow_(row) {
+  if (!row || !row.month) return false;
+  const monthSig = String(row.month || '').trim().toLowerCase();
+  if (!monthSig) return false;
+  if (monthSig === 'total' || monthSig === 'totals' || monthSig.indexOf('всього') !== -1 || monthSig.indexOf('разом') !== -1 || monthSig.indexOf('підсум') !== -1) return false;
+  return true;
+}
+
+function logDashboardReadIssue_(payload, warnings) {
+  const entry = payload || {};
+  const msg = String(entry.message || 'Dashboard monthly read issue');
+  if (Array.isArray(warnings)) warnings.push(msg);
+  Logger.log('[DASHBOARD][READ] ' + msg);
+  appendDiagnosticsLog_({
+    level: String(entry.level || 'WARN'),
+    operation: String(entry.operation || 'readMonthlyDashboardRows_'),
+    sheetName: String(entry.sheetName || CONFIG.MONTHLY_SHEET),
+    warningType: String(entry.warningType || 'DASHBOARD_MONTHLY_READ'),
+    month: String(entry.month || ''),
+    rowNumber: Number(entry.rowNumber || 0),
+    message: msg
+  });
+}
+
+function readMonthlyDashboardRows_(sheet) {
+  const source = sheet || SpreadsheetApp.getActive().getSheetByName(CONFIG.MONTHLY_SHEET);
+  const warnings = [];
+  if (!source) {
+    logDashboardReadIssue_({
+      level: 'ERROR',
+      warningType: 'MONTHLY_SHEET_NOT_FOUND',
+      message: 'Лист ' + CONFIG.MONTHLY_SHEET + ' не знайдено'
+    }, warnings);
+    throw new Error('Не знайдено лист: ' + CONFIG.MONTHLY_SHEET);
+  }
+
+  const parsed = readSheetRowsByHeaders_(source);
+  const rows = [];
+  const monthsMap = {};
+  let skippedRows = 0;
+  let brokenRows = 0;
+
+  for (let i = 0; i < parsed.rows.length; i++) {
+    const srcRow = parsed.rows[i];
+    try {
+      const normalized = normalizeMonthlyDashboardRow_(srcRow);
+      if (!isMeaningfulMonthlyDashboardRow_(normalized)) {
+        skippedRows += 1;
+        continue;
+      }
+      rows.push(normalized);
+      monthsMap[normalized.month] = true;
+    } catch (err) {
+      brokenRows += 1;
+      logDashboardReadIssue_({
+        level: 'WARN',
+        warningType: 'MONTHLY_ROW_SKIPPED',
+        rowNumber: Number(safeGetProp_(srcRow, '__rowNumber', i + 2)) || 0,
+        message: 'Пропущено пошкоджений рядок monthly report: ' + toErrorMessage_(err)
+      }, warnings);
+    }
+  }
+
+  const stats = {
+    sheetFound: true,
+    totalRows: parsed.totalRows || 0,
+    validRows: rows.length,
+    skippedRows: skippedRows,
+    brokenRows: brokenRows,
+    availableMonths: Object.keys(monthsMap).sort()
+  };
+  logDashboardReadIssue_({
+    level: 'INFO',
+    warningType: 'MONTHLY_READ_STATS',
+    message: 'monthly sheet found=yes; rows read=' + stats.totalRows +
+      '; valid=' + stats.validRows +
+      '; skipped=' + stats.skippedRows +
+      '; broken=' + stats.brokenRows +
+      '; months=' + (stats.availableMonths.join(', ') || '-')
+  }, null);
+
+  return { rows: rows, warnings: warnings, stats: stats };
+}
+
 function rebuildDashboard_() {
   const ss = SpreadsheetApp.getActive();
   const source = ss.getSheetByName(CONFIG.MONTHLY_SHEET);
@@ -7922,7 +8090,8 @@ function rebuildDashboard_() {
   const ctx = buildDashboardContext_(viewMode, selectedMonth, monthlyRows, workingCapitalAgg, {
     manualByCategoryAgg: manualByCategory,
     workingCapitalTotals: workingCapitalTotals,
-    warnings: warnings
+    warnings: warnings,
+    monthlyReadStats: monthlyData.stats || {}
   });
 
   clearDashboardBodyKeepControls_(dashboard);
@@ -8254,6 +8423,7 @@ function buildDashboardContext_(viewMode, selectedMonth, monthlyRows, workingCap
   const manualByCategoryAgg = (options && options.manualByCategoryAgg) || { byMonth: {}, totalsByCategory: {} };
   const workingCapitalTotals = (options && options.workingCapitalTotals) || getWorkingCapitalTotals_(workingCapitalRows || {});
   const warnings = (options && options.warnings) || [];
+  const monthlyReadStats = (options && options.monthlyReadStats) || {};
 
   const active = mode === 'Весь період' ? cumulativeCtx : selectedCtx;
   const activeMonthKey = mode === 'Весь період' ? (latest ? latest.month : month) : selectedCtx.selectedMonth;
@@ -8280,7 +8450,8 @@ function buildDashboardContext_(viewMode, selectedMonth, monthlyRows, workingCap
     manualTotals: manualTotals,
     workingCapitalAgg: workingCapitalRows || { byMonth: {}, rows: [], months: [] },
     workingCapitalTotals: workingCapitalTotals,
-    warnings: warnings
+    warnings: warnings,
+    monthlyReadStats: monthlyReadStats
   };
 }
 
@@ -8614,8 +8785,13 @@ function applyDashboardFormatting_(sheet) {
 function logDashboardDiagnostics_(ctx) {
   const renderedSections = 7;
   const message = [
+    'monthly sheet found=' + (ctx.monthlyReadStats && ctx.monthlyReadStats.sheetFound ? 'yes' : 'no'),
+    'monthly rows read=' + Number((ctx.monthlyReadStats && ctx.monthlyReadStats.totalRows) || 0),
+    'monthly rows valid=' + Number((ctx.monthlyReadStats && ctx.monthlyReadStats.validRows) || 0),
+    'monthly rows skipped=' + Number((ctx.monthlyReadStats && ctx.monthlyReadStats.skippedRows) || 0),
     'selected mode=' + (ctx.viewMode || '-'),
     'selected month=' + (ctx.selectedMonth || '-'),
+    'available months=' + (((ctx.monthlyReadStats && ctx.monthlyReadStats.availableMonths) || []).join(', ') || '-'),
     'months available count=' + ((ctx.months || []).length || 0),
     'latest month=' + (ctx.latestMonth || '-'),
     'previous month=' + (ctx.previousMonth || '-'),
@@ -8665,4 +8841,3 @@ function onEdit(e) {
 function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
   return;
 }
-
