@@ -33,6 +33,7 @@ const CONFIG = {
 
   SALES_TAX_REPORT_FOLDER_ID: '1k4fDrE_XYoZ0ukOByEz9A-053dIKsXSo',
   SALES_TAX_RAW_SHEET: 'SALES_TAX_RAW',
+  SETTLEMENT_FEES_RAW_SHEET: 'SETTLEMENT_FEES_RAW',
   MONTHLY_VAT_PAYOUT_SUMMARY_SHEET: 'МІСЯЧНИЙ_ЗВІТ',
   LEGACY_MONTHLY_SHEET: 'МІСЯЦІ',
   LEGACY_MONTHLY_NOTE: 'DEPRECATED: не використовується кодом. Джерело правди перенесено у МІСЯЧНИЙ_ЗВІТ.',
@@ -728,6 +729,10 @@ function importSettlementTxtFile_(fileId, options) {
   let rowIndexes = [];
 
   if (!options.auditOnly) {
+    runNonCritical_('upsertSettlementFeeRawRowsFromParsed_', function() {
+      upsertSettlementFeeRawRowsFromParsed_(parsed, fileId, fileName, importedAt, warnings);
+    }, warnings);
+
     const advancedSheet = ensureAdvancedAnalyticsSheet_();
     const summaryObjects = [];
     const advancedObjects = [];
@@ -963,6 +968,7 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
 
   const orderAgg = Object.create(null);
   const rawRows = [];
+  const feeRowsForVatMatching = [];
   const bucketBuild = buildSettlementMonthlyBuckets_(dataRows, idx, depositDate, dateReference);
   const bucketMonths = Object.keys(bucketBuild.buckets).sort();
   if (!bucketMonths.length) {
@@ -1009,6 +1015,22 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     const sku = idxSku !== undefined ? normalizeSku_(row[idxSku]) : '';
     const qty = idxQty !== undefined ? Math.max(0, Math.round(parseNumberLoose_(row[idxQty]))) : 0;
     const orderId = idxOrderId !== undefined ? String(row[idxOrderId] || '').trim() : '';
+    const normalizedOrderId = normalizeOrderId_(orderId);
+
+    if (normalizedOrderId && t === 'ItemFees') {
+      feeRowsForVatMatching.push({
+        settlementId: settlementId,
+        orderId: normalizedOrderId,
+        postedDate: cellByHeader_(row, idx, 'posted-date'),
+        depositDate: depositDate,
+        amountType: amountType,
+        amountDescription: amountDesc,
+        transactionType: transactionType,
+        amount: parseNumberLoose_(cellByHeader_(row, idx, 'amount')),
+        marketplaceName: cellByHeader_(row, idx, 'marketplace-name'),
+        sku: idxSku !== undefined ? String(row[idxSku] || '').trim() : ''
+      });
+    }
 
     if (sku || orderId) {
       const k = orderId + '||' + sku;
@@ -1109,7 +1131,8 @@ function parseSettlementTsv_(content, costMap, fileMeta, warnings) {
     },
     units: unitsTotal,
     summaryRows: summaryRows,
-    rowData: summaryRows.length ? summaryRows[0].rowData : {}
+    rowData: summaryRows.length ? summaryRows[0].rowData : {},
+    feeRowsForVatMatching: feeRowsForVatMatching
   };
 }
 
@@ -2248,7 +2271,12 @@ function classifyItemFeeByDescription_(amountDescription) {
 }
 
 function classifyItemFeeRow_(row, idx) {
-  const amountDescription = cellByHeader_(row, idx, 'amount-description');
+  let amountDescription = '';
+  if (row && !Array.isArray(row) && (!idx || typeof idx !== 'object')) {
+    amountDescription = row.amountDescription || row['Amount Description'] || row['amount-description'] || '';
+  } else {
+    amountDescription = cellByHeader_(row, idx, 'amount-description');
+  }
   return classifyItemFeeByDescription_(amountDescription);
 }
 
@@ -6283,15 +6311,339 @@ function getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth) {
   return roundMoney_(((manualExpenseVatByMonth || {})[month] || { vat: 0 }).vat || 0);
 }
 
-function sumMonthlyAmazonFeeVat_(settlementFlowByMonth, month) {
-  const flow = (settlementFlowByMonth || {})[month] || {};
+function ensureSettlementFeesRawSheet_() {
+  const headers = [
+    'Import File ID',
+    'Import File Name',
+    'Imported At',
+    'Settlement ID',
+    'Order ID',
+    'Posted Date',
+    'Deposit Date',
+    'Settlement Month',
+    'Amount Type',
+    'Amount Description',
+    'Transaction Type',
+    'Amount',
+    'Marketplace',
+    'SKU',
+    'Source Row Hash'
+  ];
+  const sh = getOrCreateSheet_(CONFIG.SETTLEMENT_FEES_RAW_SHEET);
+  if (sh.getLastRow() < 1) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return sh;
+  }
+  const existing = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  const missing = headers.filter(function(h) { return existing.indexOf(h) === -1; });
+  if (!missing.length) return sh;
+
+  const merged = existing.concat(missing);
+  const data = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues() : [];
+  sh.clearContents();
+  sh.getRange(1, 1, 1, merged.length).setValues([merged]);
+  if (data.length) {
+    const migrated = data.map(function(r) { return realignRowByHeaders_(existing, r, merged); });
+    sh.getRange(2, 1, migrated.length, merged.length).setValues(migrated);
+  }
+  return sh;
+}
+
+function deleteSettlementFeeRawRowsByFileId_(fileId) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SETTLEMENT_FEES_RAW_SHEET);
+  if (!sh || sh.getLastRow() < 2) return 0;
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const col = hm[normalizeHeaderKey_('Import File ID')];
+  if (col === undefined) return 0;
+
+  let removed = 0;
+  const kept = [];
+  for (let i = 1; i < all.length; i++) {
+    const fid = String(all[i][col] || '').trim();
+    if (fid && fid === String(fileId || '')) removed += 1;
+    else kept.push(all[i]);
+  }
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (kept.length) sh.getRange(2, 1, kept.length, headers.length).setValues(kept);
+  return removed;
+}
+
+function upsertSettlementFeeRawRowsFromParsed_(parsed, fileId, fileName, importedAt, warnings) {
+  const rows = (parsed && parsed.feeRowsForVatMatching) ? parsed.feeRowsForVatMatching : [];
+  const sh = ensureSettlementFeesRawSheet_();
+  deleteSettlementFeeRawRowsByFileId_(fileId);
+  if (!rows.length) return { inserted: 0 };
+
+  const importedAtText = Utilities.formatDate(importedAt || new Date(), CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss');
+  const data = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || {};
+    const settlementMonth = toMonthText_(r.postedDate) || toMonthText_(r.depositDate) || '';
+    const amount = parseNumberFlexible_(r.amount);
+    const hash = makeStableCompositeKey_([fileId, r.settlementId, r.orderId, r.amountType, r.amountDescription, amount, r.postedDate, i + 1]);
+    data.push([
+      fileId,
+      fileName || '',
+      importedAtText,
+      r.settlementId || '',
+      normalizeOrderId_(r.orderId),
+      r.postedDate || '',
+      r.depositDate || '',
+      settlementMonth,
+      r.amountType || '',
+      r.amountDescription || '',
+      r.transactionType || '',
+      amount,
+      r.marketplaceName || '',
+      r.sku || '',
+      hash
+    ]);
+  }
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h) { return String(h || '').trim(); });
+  const finalRows = data.map(function(r) { return realignRowByHeaders_([
+    'Import File ID', 'Import File Name', 'Imported At', 'Settlement ID', 'Order ID', 'Posted Date', 'Deposit Date', 'Settlement Month',
+    'Amount Type', 'Amount Description', 'Transaction Type', 'Amount', 'Marketplace', 'SKU', 'Source Row Hash'
+  ], r, headers); });
+  const start = Math.max(2, sh.getLastRow() + 1);
+  sh.getRange(start, 1, finalRows.length, headers.length).setValues(finalRows);
+  const hm = buildHeaderMapCaseInsensitive_(headers);
+  const amountCol = hm[normalizeHeaderKey_('Amount')];
+  if (amountCol !== undefined) safeSetNumberFormat_(sh.getRange(2, amountCol + 1, sh.getLastRow() - 1, 1), '#,##0.00', warnings || [], 'settlementFeeRaw.amount');
+  return { inserted: finalRows.length };
+}
+
+function normalizeOrderId_(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '')
+    .replace(/[^A-Z0-9-]/g, '');
+}
+
+function isValidOrderId_(value) {
+  const id = normalizeOrderId_(value);
+  if (!id) return false;
+  if (id.length < 5) return false;
+  return /^[A-Z0-9-]+$/.test(id);
+}
+
+function getSalesTaxMonthKey_(row, hm) {
+  return resolveSalesTaxAggMonth_(row, hm) || '';
+}
+
+function extractOrderIdFromSalesTaxRow_(row, hm) {
+  const raw = valueByHeader_(row, hm, 'Order ID') ||
+    valueByHeader_(row, hm, 'Amazon Order ID') ||
+    valueByHeader_(row, hm, 'order-id');
+  const normalized = normalizeOrderId_(raw);
+  return isValidOrderId_(normalized) ? normalized : '';
+}
+
+function getUniqueMonthlyOrderIdsFromSalesTax_(rows, hm) {
+  const byMonth = {};
+  for (let i = 0; i < (rows || []).length; i++) {
+    const row = rows[i];
+    const monthKey = getSalesTaxMonthKey_(row, hm);
+    const orderId = extractOrderIdFromSalesTaxRow_(row, hm);
+    if (!monthKey || !orderId) continue;
+    if (!byMonth[monthKey]) byMonth[monthKey] = {};
+    byMonth[monthKey][orderId] = true;
+  }
+  const out = {};
+  const months = Object.keys(byMonth);
+  for (let m = 0; m < months.length; m++) out[months[m]] = Object.keys(byMonth[months[m]]);
+  return out;
+}
+
+function buildSalesTaxMonthOrderIndex_(salesTaxRows, hm) {
+  return getUniqueMonthlyOrderIdsFromSalesTax_(salesTaxRows, hm);
+}
+
+function collectMonthlyOrdersFromSalesTax_(monthKey, monthOrderIndex) {
+  return ((monthOrderIndex || {})[monthKey] || []).slice();
+}
+
+function extractOrderIdFromSettlementRow_(row, hm) {
+  if (row && !Array.isArray(row)) return normalizeOrderId_(row.orderId || row['Order ID'] || '');
+  const raw = valueByHeader_(row, hm, 'Order ID') || valueByHeader_(row, hm, 'order-id');
+  const normalized = normalizeOrderId_(raw);
+  return isValidOrderId_(normalized) ? normalized : '';
+}
+
+function getSettlementRowOrderId_(row, hm) {
+  return extractOrderIdFromSettlementRow_(row, hm);
+}
+
+function isFeeSettlementRow_(row, hm) {
+  const t = (row && !Array.isArray(row))
+    ? String(row.amountType || '').trim()
+    : String(valueByHeader_(row, hm, 'Amount Type') || valueByHeader_(row, hm, 'amount-type') || '').trim();
+  return t === 'ItemFees';
+}
+
+function isRelevantAmazonFeeRow_(row, hm) {
+  if (!isFeeSettlementRow_(row, hm)) return false;
+  const amount = (row && !Array.isArray(row)) ? parseNumberFlexible_(row.amount) : parseNumberFlexible_(valueByHeader_(row, hm, 'Amount'));
+  return amount !== 0;
+}
+
+function groupSettlementRowsByOrderId_(rows, hm) {
+  const out = {};
+  for (let i = 0; i < (rows || []).length; i++) {
+    const row = rows[i];
+    const orderId = getSettlementRowOrderId_(row, hm);
+    if (!orderId) continue;
+    if (!isRelevantAmazonFeeRow_(row, hm)) continue;
+    if (!out[orderId]) out[orderId] = [];
+    out[orderId].push(row);
+  }
+  return out;
+}
+
+function buildSettlementFeeRowsByOrderId_(settlementRows, hm) {
+  return groupSettlementRowsByOrderId_(settlementRows, hm);
+}
+
+function collectSettlementFeesForOrderIds_(orderIds, settlementRowsByOrderId) {
+  const out = [];
+  for (let i = 0; i < (orderIds || []).length; i++) {
+    const id = normalizeOrderId_(orderIds[i]);
+    const rows = (settlementRowsByOrderId || {})[id] || [];
+    for (let j = 0; j < rows.length; j++) out.push(rows[j]);
+  }
+  return out;
+}
+
+function normalizeFeeAmountForVatCredit_(amount) {
+  return Math.abs(parseNumberFlexible_(amount));
+}
+
+function extractIncludedVat22FromGross_(amount) {
+  const grossAbs = normalizeFeeAmountForVatCredit_(amount);
+  if (!grossAbs) return 0;
+  return roundMoney_(grossAbs * 22 / 122);
+}
+
+function calculateOrderAmazonFeeVat_(feeRows) {
+  const res = { vat: 0, determinableRows: 0, ambiguousRows: 0, excludedRows: 0 };
+  for (let i = 0; i < (feeRows || []).length; i++) {
+    const row = feeRows[i];
+    const feeClass = classifyItemFeeRow_(row, null);
+    const vatClass = determineItemFeeVatTreatment_(row, null, feeClass);
+    if (vatClass.treatment === 'included') {
+      const amount = row && !Array.isArray(row) ? row.amount : valueByHeader_(row, {}, 'Amount');
+      res.vat = roundMoney_(res.vat + extractIncludedVat22FromGross_(amount));
+      res.determinableRows += 1;
+    } else if (vatClass.treatment === 'ambiguous') {
+      res.ambiguousRows += 1;
+    } else {
+      res.excludedRows += 1;
+    }
+  }
+  return res;
+}
+
+function calculateAmazonFeeVatForOrderSet_(orderIds, settlementRowsByOrderId, options) {
+  const diagnostics = {
+    salesTaxOrdersCount: (orderIds || []).length,
+    matchedOrdersCount: 0,
+    unmatchedOrdersCount: 0,
+    matchedFeeRowsCount: 0,
+    determinableFeeVatTotal: 0,
+    ambiguousFeeRowsCount: 0,
+    excludedFeeRowsCount: 0,
+    ordersMissingInSettlement: [],
+    ordersWithNoDeterminableVat: []
+  };
+  const uniqueOrderIds = [];
+  const seen = {};
+  for (let i = 0; i < (orderIds || []).length; i++) {
+    const id = normalizeOrderId_(orderIds[i]);
+    if (!id || seen[id]) continue;
+    seen[id] = true;
+    uniqueOrderIds.push(id);
+  }
+
+  let vatTotal = 0;
+  for (let j = 0; j < uniqueOrderIds.length; j++) {
+    const orderId = uniqueOrderIds[j];
+    const rows = (settlementRowsByOrderId || {})[orderId] || [];
+    if (!rows.length) {
+      diagnostics.unmatchedOrdersCount += 1;
+      diagnostics.ordersMissingInSettlement.push(orderId);
+      continue;
+    }
+    diagnostics.matchedOrdersCount += 1;
+    diagnostics.matchedFeeRowsCount += rows.length;
+    const orderVat = calculateOrderAmazonFeeVat_(rows);
+    vatTotal = roundMoney_(vatTotal + orderVat.vat);
+    diagnostics.determinableFeeVatTotal = roundMoney_(diagnostics.determinableFeeVatTotal + orderVat.vat);
+    diagnostics.ambiguousFeeRowsCount += orderVat.ambiguousRows;
+    diagnostics.excludedFeeRowsCount += orderVat.excludedRows;
+    if (!(orderVat.vat > 0) && rows.length) diagnostics.ordersWithNoDeterminableVat.push(orderId);
+  }
+
+  return { vatTotal: vatTotal, diagnostics: diagnostics };
+}
+
+function buildMonthlyAmazonFeeVatFromOrderMatching_(monthKey, monthOrderIndex, settlementRowsByOrderId) {
+  const orderIds = collectMonthlyOrdersFromSalesTax_(monthKey, monthOrderIndex);
+  return calculateAmazonFeeVatForOrderSet_(orderIds, settlementRowsByOrderId, {});
+}
+
+function readSalesTaxRawRowsForMatching_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SALES_TAX_RAW_SHEET);
+  if (!sh || sh.getLastRow() < 2) return { rows: [], hm: {} };
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  return { rows: all.slice(1), hm: buildHeaderMapCaseInsensitive_(headers) };
+}
+
+function readSettlementFeeRawRowsForMatching_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.SETTLEMENT_FEES_RAW_SHEET);
+  if (!sh || sh.getLastRow() < 2) return { rows: [], hm: {} };
+  const all = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const headers = all[0].map(function(h) { return String(h || '').trim(); });
+  return { rows: all.slice(1), hm: buildHeaderMapCaseInsensitive_(headers) };
+}
+
+function buildAmazonFeeVatByMonthFromOrderMatching_() {
+  const salesRaw = readSalesTaxRawRowsForMatching_();
+  const settlementRaw = readSettlementFeeRawRowsForMatching_();
+  const monthOrderIndex = buildSalesTaxMonthOrderIndex_(salesRaw.rows, salesRaw.hm);
+  const settlementByOrder = buildSettlementFeeRowsByOrderId_(settlementRaw.rows, settlementRaw.hm);
+  const months = Object.keys(monthOrderIndex).sort();
+  const byMonth = {};
+  const diagnosticsByMonth = {};
+  for (let i = 0; i < months.length; i++) {
+    const month = months[i];
+    const calc = buildMonthlyAmazonFeeVatFromOrderMatching_(month, monthOrderIndex, settlementByOrder);
+    byMonth[month] = {
+      feeVat: roundMoney_(calc.vatTotal || 0),
+      matchedOrders: calc.diagnostics.matchedOrdersCount || 0,
+      unmatchedOrders: calc.diagnostics.unmatchedOrdersCount || 0,
+      matchedFeeRows: calc.diagnostics.matchedFeeRowsCount || 0,
+      ambiguousRows: calc.diagnostics.ambiguousFeeRowsCount || 0,
+      excludedRows: calc.diagnostics.excludedFeeRowsCount || 0
+    };
+    diagnosticsByMonth[month] = calc.diagnostics;
+  }
+  return { byMonth: byMonth, diagnosticsByMonth: diagnosticsByMonth };
+}
+
+function sumMonthlyAmazonFeeVat_(amazonFeeVatByMonth, month) {
+  const flow = (amazonFeeVatByMonth || {})[month] || {};
   return roundMoney_(flow.feeVat || 0);
 }
 
-function buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth) {
+function buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth, amazonFeeVatByMonth) {
   const sales = (salesAgg || {})[month] || {};
   const salesVat = roundMoney_(sales.vatPayable || 0);
-  const feeVat = sumMonthlyAmazonFeeVat_(settlementFlowByMonth, month);
+  const feeVat = sumMonthlyAmazonFeeVat_(amazonFeeVatByMonth, month);
   const expenseVat = roundMoney_(getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {}));
   const vatCredit = roundMoney_(feeVat + expenseVat);
   const vatToPay = roundMoney_(salesVat - vatCredit);
@@ -6499,6 +6851,7 @@ function rebuildLatestMonthOnly_() {
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFlow = buildSettlementFeesByMonth_();
+  const amazonFeeVatMatching = buildAmazonFeeVatByMonthFromOrderMatching_();
   const cogsByMonth = buildSettlementCogsByMonth_();
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
@@ -6513,7 +6866,7 @@ function rebuildLatestMonthOnly_() {
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getMonthlyVatPayoutSheet_();
@@ -6529,6 +6882,7 @@ function rebuildMonthlyVatPayoutSummary_() {
 
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const settlementFlow = buildSettlementFeesByMonth_();
+  const amazonFeeVatMatching = buildAmazonFeeVatByMonthFromOrderMatching_();
   const cogsByMonth = buildSettlementCogsByMonth_();
   const salesAgg = buildSalesTaxMonthlyAgg_().byMonth || {};
   const manualVat = readManualVatByMonth_();
@@ -6543,7 +6897,7 @@ function rebuildMonthlyVatPayoutSummary_() {
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth);
   });
 
   const sh = getMonthlyVatPayoutSheet_();
@@ -6589,7 +6943,7 @@ function monthlyVatPayoutHeaders_() {
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpenseVatByMonth, manualExpensesByMonth) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpenseVatByMonth, manualExpensesByMonth, amazonFeeVatByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
   const flow = settlementFlowByMonth[month] || {
@@ -6606,7 +6960,7 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, 
   };
   const cogs = roundMoney_((cogsByMonth[month] || { cogs: 0 }).cogs);
   const salesNet = roundMoney_(s.salesAmount || 0);
-  const vatMetrics = buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth);
+  const vatMetrics = buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualExpenseVatByMonth, amazonFeeVatByMonth);
   const salesVat = vatMetrics.salesVat;
   const salesGross = roundMoney_(s.grossSales || (salesNet + salesVat));
   const hasManualFees = !!manualFeesByMonth[month];
@@ -6839,6 +7193,7 @@ function writeDiagnostics_() {
   const payoutByMonth = buildSettlementPayoutByMonth_();
   const cogsByMonth = buildSettlementCogsByMonth_();
   const settlementFlow = buildSettlementFeesByMonth_();
+  const amazonFeeVatMatching = buildAmazonFeeVatByMonthFromOrderMatching_();
   const manualVat = readManualVatByMonth_();
   const manualFees = readManualFeesByMonth_();
   const manualExpenses = collectManualExpensesByMonth_();
@@ -6872,10 +7227,11 @@ function writeDiagnostics_() {
   }
 
   rows.push(['INFO', 'C. Підсумок по місяцях', 'Місяць', 'Виплата', 'COGS', 'Комісії settlement', 'НДС з продажів', 'Сплачений НДС', 'Ручні витрати']);
-  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), Object.keys(manualExpenseVat.byMonth)))))));
+  const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), mergeMonthKeys_(Object.keys(manualExpenseVat.byMonth), Object.keys(amazonFeeVatMatching.byMonth || {}))))))));
   for (let k = 0; k < months.length; k++) {
     const m = months[k];
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(m, manualVat.byMonth, manualExpenseVat.byMonth, (settlementFlow[m] || { feeVat: 0 }).feeVat);
+    const matchedFeeVat = ((amazonFeeVatMatching.byMonth || {})[m] || { feeVat: 0 }).feeVat || 0;
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(m, manualVat.byMonth, manualExpenseVat.byMonth, matchedFeeVat);
     rows.push(['DATA', 'C. Підсумок по місяцях', m,
       (payoutByMonth[m] || { paidOut: 0 }).paidOut,
       (cogsByMonth[m] || { cogs: 0 }).cogs,
@@ -6886,18 +7242,39 @@ function writeDiagnostics_() {
     ]);
   }
 
-  rows.push(['INFO', 'C1. Settlement VAT/flow', 'Місяць', 'VAT з продажів', 'VAT у комісіях Amazon', 'Fee VAT ambiguous rows', 'Усі зарахування', 'Усі утримання', 'Refunds / Shipping / Adjustments']);
+  rows.push(['INFO', 'C1. Settlement VAT/flow', 'Місяць', 'VAT з продажів', 'VAT у комісіях Amazon (order-matched)', 'Fee VAT ambiguous rows', 'Усі зарахування', 'Усі утримання', 'Refunds / Shipping / Adjustments']);
   for (let kf = 0; kf < months.length; kf++) {
     const km = months[kf];
     const flow = settlementFlow[km] || {};
+    const feeMatch = (amazonFeeVatMatching.byMonth || {})[km] || {};
     rows.push(['DATA', 'C1. Settlement VAT/flow', km,
       roundMoney_(flow.salesVat || 0),
-      roundMoney_(flow.feeVat || 0),
-      roundMoney_(flow.feeVatAmbiguousRows || 0),
+      roundMoney_(feeMatch.feeVat || 0),
+      roundMoney_(feeMatch.ambiguousRows || 0),
       roundMoney_(flow.credits || 0),
       roundMoney_(flow.debits || 0),
       'R:' + roundMoney_(flow.refunds || 0) + ' | S:' + roundMoney_(flow.shipping || 0) + ' | A:' + roundMoney_(flow.adjustments || 0)
     ]);
+  }
+
+  rows.push(['INFO', 'C2. Amazon Fee VAT order matching', 'Місяць', 'sales/tax orders', 'matched orders', 'unmatched orders', 'matched fee rows', 'determinable fee VAT', 'ambiguous/excluded']);
+  const matchDiagMonths = Object.keys(amazonFeeVatMatching.diagnosticsByMonth || {}).sort();
+  for (let md = 0; md < matchDiagMonths.length; md++) {
+    const mk = matchDiagMonths[md];
+    const d = amazonFeeVatMatching.diagnosticsByMonth[mk] || {};
+    rows.push(['DATA', 'C2. Amazon Fee VAT order matching', mk,
+      Number(d.salesTaxOrdersCount || 0),
+      Number(d.matchedOrdersCount || 0),
+      Number(d.unmatchedOrdersCount || 0),
+      Number(d.matchedFeeRowsCount || 0),
+      roundMoney_(d.determinableFeeVatTotal || 0),
+      'amb:' + Number(d.ambiguousFeeRowsCount || 0) + ' | excl:' + Number(d.excludedFeeRowsCount || 0)
+    ]);
+    if ((d.ordersMissingInSettlement || []).length) {
+      rows.push(['WARN', 'C2. Amazon Fee VAT order matching', mk, 'Orders in SALES_TAX_RAW not found in settlement',
+        (d.ordersMissingInSettlement || []).slice(0, 20).join(', '), '', '', '', ''
+      ]);
+    }
   }
 
   rows.push(['INFO', 'C1b. VAT chain by settlement', 'Місяць', 'Settlement ID/File ID', 'Fee rows', 'Determinable fee VAT', 'Ambiguous fee rows', 'VAT до заліку', 'VAT до доплати']);
@@ -6905,7 +7282,7 @@ function writeDiagnostics_() {
   for (let fk = 0; fk < feeVatKeys.length; fk++) {
     const key = feeVatKeys[fk];
     const info = feeVatBySettlement[key] || {};
-    const vatMetrics = buildMonthlyVatMetrics_(info.month, salesAgg, settlementFlow, manualExpenseVat.byMonth);
+    const vatMetrics = buildMonthlyVatMetrics_(info.month, salesAgg, settlementFlow, manualExpenseVat.byMonth, amazonFeeVatMatching.byMonth);
     rows.push(['DATA', 'C1b. VAT chain by settlement', info.month, info.settlementRef, info.feeRows, roundMoney_(info.determinableFeeVat || 0), roundMoney_(info.ambiguousRows || 0), vatMetrics.vatCredit, vatMetrics.vatToPay]);
   }
 
@@ -6914,7 +7291,7 @@ function writeDiagnostics_() {
     const month = months[k2];
     const payout = (payoutByMonth[month] || { paidOut: 0 }).paidOut;
     const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, manualVat.byMonth, manualExpenseVat.byMonth, (settlementFlow[month] || { feeVat: 0 }).feeVat);
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, manualVat.byMonth, manualExpenseVat.byMonth, ((amazonFeeVatMatching.byMonth || {})[month] || { feeVat: 0 }).feeVat);
     const vatToPay = roundMoney_(((salesAgg[month] || { vatPayable: 0 }).vatPayable || 0) - paidVatBreakdown.totalPaidVat);
     const profitBeforeVat = roundMoney_(payout - cogs);
     const cashAfterVat = roundMoney_(profitBeforeVat - vatToPay);
@@ -6924,7 +7301,7 @@ function writeDiagnostics_() {
   rows.push(['INFO', 'C3. VAT reserve by month', 'Місяць', 'НДС нараховано', 'Вже сплачений НДС', 'НДС до оплати', 'Тимчасово в обороті', 'Ризик', '']);
   for (let k3 = 0; k3 < months.length; k3++) {
     const monthKey = months[k3];
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(monthKey, manualVat.byMonth, manualExpenseVat.byMonth, (settlementFlow[monthKey] || { feeVat: 0 }).feeVat);
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(monthKey, manualVat.byMonth, manualExpenseVat.byMonth, ((amazonFeeVatMatching.byMonth || {})[monthKey] || { feeVat: 0 }).feeVat);
     const vatAccrued = roundMoney_((salesAgg[monthKey] || { vatPayable: 0 }).vatPayable || 0);
     const vatToPay = roundMoney_(vatAccrued - paidVatBreakdown.totalPaidVat);
     rows.push(['DATA', 'C3. VAT reserve by month', monthKey, vatAccrued, paidVatBreakdown.totalPaidVat, vatToPay, vatToPay, vatToPay > 0 ? 'ризик: є резерв' : 'ok', '']);
