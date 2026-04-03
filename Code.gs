@@ -6368,6 +6368,125 @@ function getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth) {
   return roundMoney_(((manualExpenseVatByMonth || {})[month] || { vat: 0 }).vat || 0);
 }
 
+function normalizeTextForVatPaymentMatch_(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isVatPaymentKeyword_(value) {
+  const text = normalizeTextForVatPaymentMatch_(value);
+  if (!text) return false;
+  const strongPatterns = [
+    /\bvat\b/,
+    /\biva\b/,
+    /\btax\b/,
+    /\bндс\b/,
+    /\bпдв\b/,
+    /\bподат(ок|ку|ки|ків)\b/,
+    /value added tax/,
+    /imposta sul valore aggiunto/
+  ];
+  for (let i = 0; i < strongPatterns.length; i++) {
+    if (strongPatterns[i].test(text)) return true;
+  }
+  return false;
+}
+
+function isVatPaymentExclusionKeyword_(value) {
+  const text = normalizeTextForVatPaymentMatch_(value);
+  if (!text) return false;
+  return (
+    text.indexOf('vat credit') !== -1 ||
+    text.indexOf('vat до заліку') !== -1 ||
+    text.indexOf('credit note') !== -1 ||
+    text.indexOf('refund') !== -1 ||
+    text.indexOf('reimbursement') !== -1
+  );
+}
+
+function getManualExpenseVatPaymentSignals_(row) {
+  if (!row) return [];
+  return [
+    row['Категорія коштів'],
+    row['Категорія'],
+    row['Тип витрати'],
+    row['Опис'],
+    row['Тип документа']
+  ];
+}
+
+function isVatPaymentManualExpenseRow_(row) {
+  if (!row || !row.__active) return false;
+  if (!row.__month) return false;
+  const amount = roundMoney_(row.__grossAmount || row.__effectiveAmount || row.__netAmount || 0);
+  if (!(amount > 0)) return false;
+  const signals = getManualExpenseVatPaymentSignals_(row);
+  let hasVatKeyword = false;
+  for (let i = 0; i < signals.length; i++) {
+    const signal = signals[i];
+    if (!signal) continue;
+    if (isVatPaymentExclusionKeyword_(signal)) continue;
+    if (isVatPaymentKeyword_(signal)) {
+      hasVatKeyword = true;
+      break;
+    }
+  }
+  return hasVatKeyword;
+}
+
+function getPaidVatByMonthFromManualExpenses_(rows) {
+  const out = {};
+  const diagnostics = {
+    totalRows: 0,
+    activeRows: 0,
+    matchedRows: 0,
+    skippedAmbiguousRows: 0,
+    categorization: 'signals: Категорія коштів / Категорія / Тип витрати / Опис / Тип документа + keywords VAT/IVA/НДС/ПДВ/Tax',
+    matchedRowNumbers: [],
+    skippedAmbiguousRowNumbers: []
+  };
+  const list = rows || [];
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i] || {};
+    diagnostics.totalRows += 1;
+    if (!row.__active) continue;
+    diagnostics.activeRows += 1;
+    if (!row.__month) continue;
+    const amount = roundMoney_(row.__grossAmount || row.__effectiveAmount || row.__netAmount || 0);
+    if (!(amount > 0)) continue;
+
+    const signals = getManualExpenseVatPaymentSignals_(row);
+    let hasKeyword = false;
+    let hasExclusion = false;
+    for (let s = 0; s < signals.length; s++) {
+      if (!signals[s]) continue;
+      if (isVatPaymentKeyword_(signals[s])) hasKeyword = true;
+      if (isVatPaymentExclusionKeyword_(signals[s])) hasExclusion = true;
+    }
+
+    if (!hasKeyword) continue;
+    if (hasExclusion) {
+      diagnostics.skippedAmbiguousRows += 1;
+      diagnostics.skippedAmbiguousRowNumbers.push(row.__rowNumber || 0);
+      continue;
+    }
+    if (!isVatPaymentManualExpenseRow_(row)) continue;
+
+    if (!out[row.__month]) out[row.__month] = { paidVat: 0, rows: 0 };
+    out[row.__month].paidVat = roundMoney_(out[row.__month].paidVat + amount);
+    out[row.__month].rows += 1;
+    diagnostics.matchedRows += 1;
+    diagnostics.matchedRowNumbers.push(row.__rowNumber || 0);
+  }
+  return { byMonth: out, diagnostics: diagnostics };
+}
+
+function buildMonthlyPaidVatIndex_(rows) {
+  return getPaidVatByMonthFromManualExpenses_(rows || []);
+}
+
 function ensureSettlementFeesRawSheet_() {
   const headers = [
     'Import File ID',
@@ -6847,11 +6966,11 @@ function buildMonthlyVatMetrics_(month, salesAgg, settlementFlowByMonth, manualE
   };
 }
 
-function getPaidVatBreakdownForMonth_(month, manualVatByMonth, manualExpenseVatByMonth, amazonFeeVat) {
-  const manualInputVat = roundMoney_(((manualVatByMonth || {})[month] || { paidVat: 0 }).paidVat || 0);
-  const manualExpenseVat = getManualExpenseVatTotalForMonth_(month, manualExpenseVatByMonth || {});
-  const feeVat = roundMoney_(amazonFeeVat || 0);
-  const totalPaidVat = roundMoney_(manualInputVat + manualExpenseVat + feeVat);
+function getPaidVatBreakdownForMonth_(month, paidVatByMonth) {
+  const manualInputVat = 0;
+  const manualExpenseVat = 0;
+  const feeVat = 0;
+  const totalPaidVat = roundMoney_(((paidVatByMonth || {})[month] || { paidVat: 0 }).paidVat || 0);
   return {
     manualInputVat: manualInputVat,
     manualExpenseVat: manualExpenseVat,
@@ -7049,6 +7168,7 @@ function rebuildLatestMonthOnly_() {
   const manualFees = readManualFeesByMonth_();
   const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
   const manualExpenses = collectManualExpensesByMonth_();
+  const paidVatIndex = buildMonthlyPaidVatIndex_(getManualExpensesData_().rows || []);
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
@@ -7057,7 +7177,7 @@ function rebuildLatestMonthOnly_() {
   if (!months.length) throw new Error('Немає даних для перерахунку останнього місяця.');
 
   const month = months[months.length - 1];
-  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth);
+  const row = buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth, paidVatIndex.byMonth);
 
   const headers = monthlyVatPayoutHeaders_();
   const sh = getMonthlyVatPayoutSheet_();
@@ -7066,7 +7186,7 @@ function rebuildLatestMonthOnly_() {
   sh.getRange(2, 1, 1, headers.length).setValues([row]);
   applyMonthlyVatPayoutFormats_(sh, 1);
 
-  return { month: month, paidOut: row[1], vatToPay: row[13], settlementCount: row[22], salesFileCount: row[23] };
+  return { month: month, paidOut: row[1], vatToPay: row[13], settlementCount: row[24], salesFileCount: row[25] };
 }
 
 function rebuildMonthlyVatPayoutSummary_() {
@@ -7080,6 +7200,7 @@ function rebuildMonthlyVatPayoutSummary_() {
   const manualFees = readManualFeesByMonth_();
   const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
   const manualExpenses = collectManualExpensesByMonth_();
+  const paidVatIndex = buildMonthlyPaidVatIndex_(getManualExpensesData_().rows || []);
 
   const months = mergeMonthKeys_(
     mergeMonthKeys_(Object.keys(payoutByMonth), Object.keys(salesAgg)),
@@ -7088,7 +7209,7 @@ function rebuildMonthlyVatPayoutSummary_() {
 
   const headers = monthlyVatPayoutHeaders_();
   const rows = months.map(function(m) {
-    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth);
+    return buildMonthlyVatPayoutRow_(m, payoutByMonth, settlementFlow, cogsByMonth, salesAgg, manualVat.byMonth, manualFees.byMonth, manualExpenseVat.byMonth, manualExpenses.byMonth, amazonFeeVatMatching.byMonth, paidVatIndex.byMonth);
   });
 
   const sh = getMonthlyVatPayoutSheet_();
@@ -7120,8 +7241,10 @@ function monthlyVatPayoutHeaders_() {
     'ПДВ з витрат',
     'VAT до заліку',
     'VAT до доплати',
+    'Фактично сплачений VAT',
+    'Несплачений VAT',
     'Прибуток до НДС',
-    'Залишок після НДС',
+    'База для фондів',
     'Бізнес витрати',
     'Зарплата',
     'Інше',
@@ -7134,7 +7257,7 @@ function monthlyVatPayoutHeaders_() {
   ];
 }
 
-function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpenseVatByMonth, manualExpensesByMonth, amazonFeeVatByMonth) {
+function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, cogsByMonth, salesAgg, manualVatByMonth, manualFeesByMonth, manualExpenseVatByMonth, manualExpensesByMonth, amazonFeeVatByMonth, paidVatByMonth) {
   const p = payoutByMonth[month] || { paidOut: 0, fileIds: {} };
   const s = salesAgg[month] || { salesAmount: 0, vatPayable: 0, grossSales: 0, fileIds: {}, rows: 0 };
   const flow = settlementFlowByMonth[month] || {
@@ -7160,22 +7283,25 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, 
   const feeVat = vatMetrics.feeVat;
   const vatCredit = vatMetrics.vatCredit;
   const vatToPay = vatMetrics.vatToPay;
+  const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, paidVatByMonth);
+  const paidVatActual = roundMoney_(paidVatBreakdown.totalPaidVat || 0);
+  const unpaidVat = roundMoney_(Math.max(vatToPay - paidVatActual, 0));
   const settlementProfit = roundMoney_(p.paidOut - cogs);
   const manualExpenses = roundMoney_(((manualExpensesByMonth || {})[month] || { amount: 0 }).amount || 0);
   const profitBeforeVat = roundMoney_(settlementProfit - manualExpenses);
-  const cashAfterVat = roundMoney_(profitBeforeVat - vatToPay);
+  const fundBase = roundMoney_(profitBeforeVat - paidVatActual);
+  const cashAfterVat = fundBase;
   const netCash = roundMoney_(profitBeforeVat);
   const settlementCount = Object.keys(p.fileIds || {}).length;
   const salesFileCount = Object.keys(s.fileIds || {}).length;
-  const fundBase = cashAfterVat;
   const businessFund = roundMoney_(fundBase * 0.12);
   const salaryFund = roundMoney_(fundBase * 0.07);
   const otherFund = roundMoney_(fundBase * 0.06);
   const reinvestFromProfit = roundMoney_(fundBase * 0.75);
-  const fullReinvest = roundMoney_(cogs + reinvestFromProfit);
+  const fullReinvest = roundMoney_(cogs + reinvestFromProfit + unpaidVat);
   const notes =
     (hasManualFees ? 'Комісії: ручне перевизначення. ' : 'Комісії: із settlement. ') +
-    'VAT fee rows: ' + feeVat.toFixed(2) + '. ' +
+    'VAT fee rows: ' + feeVat.toFixed(2) + '. paid VAT фактично: ' + paidVatActual.toFixed(2) + '. ' +
     buildMonthlyVatPayoutNote_(p.paidOut, salesNet, vatToPay, settlementCount, salesFileCount, s.rows);
 
   return [
@@ -7193,8 +7319,10 @@ function buildMonthlyVatPayoutRow_(month, payoutByMonth, settlementFlowByMonth, 
     roundMoney_(expenseVat),
     roundMoney_(vatCredit),
     vatToPay,
+    roundMoney_(paidVatActual),
+    roundMoney_(unpaidVat),
     roundMoney_(profitBeforeVat),
-    roundMoney_(cashAfterVat),
+    roundMoney_(fundBase),
     roundMoney_(businessFund),
     roundMoney_(salaryFund),
     roundMoney_(otherFund),
@@ -7211,8 +7339,8 @@ function applyMonthlyVatPayoutFormats_(sheet, rowCount) {
   if (!sheet || rowCount <= 0) return;
   safeSetNumberFormat_(sheet.getRange(2, 1, rowCount, 1), '@', [], 'monthly.month');
   safeSetNumberFormat_(sheet.getRange(2, 2, rowCount, 23), '#,##0.00', [], 'monthly.money');
-  safeSetNumberFormat_(sheet.getRange(2, 23, rowCount, 2), '0', [], 'monthly.counts');
-  safeSetNumberFormat_(sheet.getRange(2, 25, rowCount, 1), '@', [], 'monthly.notes');
+  safeSetNumberFormat_(sheet.getRange(2, 25, rowCount, 2), '0', [], 'monthly.counts');
+  safeSetNumberFormat_(sheet.getRange(2, 27, rowCount, 1), '@', [], 'monthly.notes');
 }
 
 function buildSettlementFeesByMonth_() {
@@ -7442,6 +7570,7 @@ function writeDiagnostics_() {
   const manualExpenses = collectManualExpensesByMonth_();
   const manualByFundCategory = collectManualExpensesByFundCategoryByMonth_();
   const manualExpenseVat = collectManualExpenseVatByMonthReadOnly_();
+  const paidVatIndex = buildMonthlyPaidVatIndex_(getManualExpensesData_().rows || []);
   const manualValidation = validateManualExpenseRows_();
   const manualVatValidation = validateManualExpenseVatRows_();
   const purchasePreview = collectPurchaseRowsForSync_();
@@ -7475,8 +7604,7 @@ function writeDiagnostics_() {
   const months = mergeMonthKeys_(Object.keys(payoutByMonth), mergeMonthKeys_(Object.keys(salesAgg), mergeMonthKeys_(Object.keys(cogsByMonth), mergeMonthKeys_(Object.keys(manualVat.byMonth), mergeMonthKeys_(Object.keys(manualFees.byMonth), mergeMonthKeys_(Object.keys(manualExpenses.byMonth), mergeMonthKeys_(Object.keys(manualExpenseVat.byMonth), Object.keys(amazonFeeVatMatching.byMonth || {}))))))));
   for (let k = 0; k < months.length; k++) {
     const m = months[k];
-    const matchedFeeVat = ((amazonFeeVatMatching.byMonth || {})[m] || { feeVat: 0 }).feeVat || 0;
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(m, manualVat.byMonth, manualExpenseVat.byMonth, matchedFeeVat);
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(m, paidVatIndex.byMonth);
     rows.push(['DATA', 'C. Підсумок по місяцях', m,
       (payoutByMonth[m] || { paidOut: 0 }).paidOut,
       (cogsByMonth[m] || { cogs: 0 }).cogs,
@@ -7491,9 +7619,10 @@ function writeDiagnostics_() {
     const settlementProfit = roundMoney_(payout - cogs);
     const manualExp = roundMoney_((manualExpenses.byMonth[m] || { amount: 0 }).amount || 0);
     const preVatProfit = roundMoney_(settlementProfit - manualExp);
-    const postVatProfit = roundMoney_(preVatProfit - vatMetrics.vatToPay);
-    const reinvestFromProfit = roundMoney_(postVatProfit * 0.75);
-    const fullReinvest = roundMoney_(cogs + reinvestFromProfit);
+    const fundBase = roundMoney_(preVatProfit - paidVatBreakdown.totalPaidVat);
+    const unpaidVat = roundMoney_(Math.max(vatMetrics.vatToPay - paidVatBreakdown.totalPaidVat, 0));
+    const reinvestFromProfit = roundMoney_(fundBase * 0.75);
+    const fullReinvest = roundMoney_(cogs + reinvestFromProfit + unpaidVat);
     const sourceMap = 'turnover=sales_tax_raw; vat_sales=sales_tax_raw; payout=settlement; cogs=settlement; settlement_profit=settlement';
     const warn = [];
     if (((amazonFeeVatMatching.byMonth || {})[m] || { unmatchedOrders: 0 }).unmatchedOrders > 0) warn.push('WARN: unmatched orders in fee VAT matching');
@@ -7513,11 +7642,12 @@ function writeDiagnostics_() {
       'vatCredit=' + roundMoney_(vatMetrics.vatCredit || 0),
       'vatDue=' + roundMoney_(vatMetrics.vatToPay || 0),
       'preVAT=' + preVatProfit,
-      'postVAT=' + postVatProfit
+      'paidVAT=' + paidVatBreakdown.totalPaidVat
     ]);
     rows.push(['DATA', 'C.1 Full monthly chain', m,
       'reinvestFromProfit=' + reinvestFromProfit,
       'fullReinvestFund=' + fullReinvest,
+      'unpaidVAT=' + unpaidVat,
       sourceMap,
       warn.join(' | '),
       '', '', '', ''
@@ -7529,7 +7659,7 @@ function writeDiagnostics_() {
         'settlementProfit=' + settlementProfit,
         'preVAT=' + preVatProfit,
         'vatDue=' + roundMoney_(vatMetrics.vatToPay || 0),
-        'postVAT=' + postVatProfit,
+        'fundBase=' + fundBase,
         'fullReinvest=' + fullReinvest
       ]);
     }
@@ -7587,20 +7717,37 @@ function writeDiagnostics_() {
     const month = months[k2];
     const payout = (payoutByMonth[month] || { paidOut: 0 }).paidOut;
     const cogs = (cogsByMonth[month] || { cogs: 0 }).cogs;
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, manualVat.byMonth, manualExpenseVat.byMonth, ((amazonFeeVatMatching.byMonth || {})[month] || { feeVat: 0 }).feeVat);
-    const vatToPay = roundMoney_(((salesAgg[month] || { vatPayable: 0 }).vatPayable || 0) - paidVatBreakdown.totalPaidVat);
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(month, paidVatIndex.byMonth);
+    const vatToPay = roundMoney_(((salesAgg[month] || { vatPayable: 0 }).vatPayable || 0) - ((buildMonthlyVatMetrics_(month, salesAgg, settlementFlow, manualExpenseVat.byMonth, amazonFeeVatMatching.byMonth) || {}).vatCredit || 0));
     const profitBeforeVat = roundMoney_(payout - cogs);
-    const cashAfterVat = roundMoney_(profitBeforeVat - vatToPay);
-    rows.push(['DATA', 'C2. Cashflow totals by month', month, payout, cogs, profitBeforeVat, vatToPay, cashAfterVat, cashAfterVat]);
+    const fundBase = roundMoney_(profitBeforeVat - paidVatBreakdown.totalPaidVat);
+    rows.push(['DATA', 'C2. Cashflow totals by month', month, payout, cogs, profitBeforeVat, vatToPay, fundBase, fundBase]);
   }
 
   rows.push(['INFO', 'C3. VAT reserve by month', 'Місяць', 'НДС нараховано', 'Вже сплачений НДС', 'НДС до оплати', 'Тимчасово в обороті', 'Ризик', '']);
   for (let k3 = 0; k3 < months.length; k3++) {
     const monthKey = months[k3];
-    const paidVatBreakdown = getPaidVatBreakdownForMonth_(monthKey, manualVat.byMonth, manualExpenseVat.byMonth, ((amazonFeeVatMatching.byMonth || {})[monthKey] || { feeVat: 0 }).feeVat);
+    const paidVatBreakdown = getPaidVatBreakdownForMonth_(monthKey, paidVatIndex.byMonth);
     const vatAccrued = roundMoney_((salesAgg[monthKey] || { vatPayable: 0 }).vatPayable || 0);
-    const vatToPay = roundMoney_(vatAccrued - paidVatBreakdown.totalPaidVat);
-    rows.push(['DATA', 'C3. VAT reserve by month', monthKey, vatAccrued, paidVatBreakdown.totalPaidVat, vatToPay, vatToPay, vatToPay > 0 ? 'ризик: є резерв' : 'ok', '']);
+    const vatToPay = roundMoney_((buildMonthlyVatMetrics_(monthKey, salesAgg, settlementFlow, manualExpenseVat.byMonth, amazonFeeVatMatching.byMonth) || {}).vatToPay || 0);
+    const unpaidVat = roundMoney_(Math.max(vatToPay - paidVatBreakdown.totalPaidVat, 0));
+    rows.push(['DATA', 'C3. VAT reserve by month', monthKey, vatAccrued, paidVatBreakdown.totalPaidVat, vatToPay, unpaidVat, unpaidVat > 0 ? 'ризик: є резерв' : 'ok', '']);
+  }
+  rows.push(['INFO', 'C4. Fund base diagnostics', 'Місяць', 'Прибуток до НДС', 'Фактично сплачений VAT', 'VAT до доплати', 'Несплачений VAT', 'База для фондів', 'Реінвест із прибутку | COGS | Повний фонд реінвесту']);
+  for (let k4 = 0; k4 < months.length; k4++) {
+    const monthDiag = months[k4];
+    const payoutDiag = roundMoney_((payoutByMonth[monthDiag] || { paidOut: 0 }).paidOut || 0);
+    const cogsDiag = roundMoney_((cogsByMonth[monthDiag] || { cogs: 0 }).cogs || 0);
+    const manualExpDiag = roundMoney_((manualExpenses.byMonth[monthDiag] || { amount: 0 }).amount || 0);
+    const profitBeforeVatDiag = roundMoney_(payoutDiag - cogsDiag - manualExpDiag);
+    const vatMetricsDiag = buildMonthlyVatMetrics_(monthDiag, salesAgg, settlementFlow, manualExpenseVat.byMonth, amazonFeeVatMatching.byMonth);
+    const vatToPayDiag = roundMoney_(vatMetricsDiag.vatToPay || 0);
+    const paidVatDiag = roundMoney_(((paidVatIndex.byMonth || {})[monthDiag] || { paidVat: 0 }).paidVat || 0);
+    const unpaidVatDiag = roundMoney_(Math.max(vatToPayDiag - paidVatDiag, 0));
+    const fundBaseDiag = roundMoney_(profitBeforeVatDiag - paidVatDiag);
+    const reinvestFromProfitDiag = roundMoney_(fundBaseDiag * 0.75);
+    const fullReinvestDiag = roundMoney_(cogsDiag + reinvestFromProfitDiag + unpaidVatDiag);
+    rows.push(['DATA', 'C4. Fund base diagnostics', monthDiag, profitBeforeVatDiag, paidVatDiag, vatToPayDiag, unpaidVatDiag, fundBaseDiag, reinvestFromProfitDiag + ' | ' + cogsDiag + ' | ' + fullReinvestDiag]);
   }
 
   rows.push(['INFO', 'D. Ручні витрати', 'Усього рядків', manualValidation.totalRows, 'Активні рядки', manualValidation.activeRows, 'У прибутку', manualValidation.includedInProfitRows, 'Неактивні: ' + manualValidation.inactiveRows]);
@@ -7637,13 +7784,14 @@ function writeDiagnostics_() {
     rows.push(['DATA', 'F2. НДС з ручних витрат по місяцях', vem, ve.vat, ve.rows, 'Активні рядки з валідною датою і НДС > 0', '', '', '']);
   }
 
-  rows.push(['INFO', 'F3. Комбінований сплачений НДС', 'Місяць', 'НДС введення', 'НДС ручні витрати', 'Разом сплачений НДС', '', '', '']);
-  const combinedVatMonths = mergeMonthKeys_(Object.keys(manualVat.byMonth), Object.keys(manualExpenseVat.byMonth));
+  rows.push(['INFO', 'F3. Фактично сплачений VAT (РУЧНІ_ВИТРАТИ)', 'Місяць', 'Фактично сплачений VAT', 'Рядків', 'Категоризація', '', '', '']);
+  const combinedVatMonths = Object.keys(paidVatIndex.byMonth || {}).sort();
   for (let y3 = 0; y3 < combinedVatMonths.length; y3++) {
     const cvm = combinedVatMonths[y3];
-    const breakdown = getPaidVatBreakdownForMonth_(cvm, manualVat.byMonth, manualExpenseVat.byMonth);
-    rows.push(['DATA', 'F3. Комбінований сплачений НДС', cvm, breakdown.manualInputVat, breakdown.manualExpenseVat, breakdown.totalPaidVat, '', '', '']);
+    const breakdown = getPaidVatBreakdownForMonth_(cvm, paidVatIndex.byMonth);
+    rows.push(['DATA', 'F3. Фактично сплачений VAT (РУЧНІ_ВИТРАТИ)', cvm, breakdown.totalPaidVat, ((paidVatIndex.byMonth || {})[cvm] || {}).rows || 0, paidVatIndex.diagnostics.categorization, '', '', '']);
   }
+  rows.push(['INFO', 'F4. VAT payment detection diagnostics', 'Matched rows', paidVatIndex.diagnostics.matchedRows || 0, 'Skipped ambiguous rows', paidVatIndex.diagnostics.skippedAmbiguousRows || 0, 'Total active rows', paidVatIndex.diagnostics.activeRows || 0, '']);
 
   rows.push(['INFO', 'G. Ручні комісії по місяцях', 'Місяць', 'Комісії', 'Рядків', 'Попередження', '', '', '']);
   const feeMonths = Object.keys(manualFees.byMonth).sort();
@@ -7960,8 +8108,11 @@ function normalizeMonthlyDashboardRow_(row) {
     vatExpense: safeParseNumber_(pick_(['ПДВ з витрат', 'Expense VAT'], 0)),
     vatCredit: safeParseNumber_(pick_(['VAT до заліку', 'VAT Credit'], 0)),
     vatToPay: safeParseNumber_(pick_(['VAT до доплати', 'VAT Payable'], 0)),
+    paidVatActual: safeParseNumber_(pick_(['Фактично сплачений VAT', 'Сплачений VAT', 'Paid VAT'], 0)),
+    unpaidVat: safeParseNumber_(pick_(['Несплачений VAT', 'Unpaid VAT'], 0)),
     profitBeforeVat: safeParseNumber_(pick_(['Прибуток до НДС', 'Profit Before VAT'], 0)),
-    cashAfterVat: safeParseNumber_(pick_(['Залишок після НДС', 'Cash After VAT'], 0)),
+    cashAfterVat: safeParseNumber_(pick_(['База для фондів', 'Залишок після НДС', 'Cash After VAT', 'Fund Base'], 0)),
+    fundBase: safeParseNumber_(pick_(['База для фондів', 'Залишок після НДС', 'Cash After VAT', 'Fund Base'], 0)),
     businessExpenses: safeParseNumber_(pick_(['Бізнес витрати', 'Business Expenses'], 0)),
     salary: safeParseNumber_(pick_(['Зарплата', 'Salary'], 0)),
     other: safeParseNumber_(pick_(['Інше', 'Other'], 0)),
@@ -8319,8 +8470,11 @@ function buildCumulativeContext_(monthlyRows, workingCapitalRows) {
     vatExpense: 0,
     vatCredit: 0,
     vatToPay: 0,
+    paidVatActual: 0,
+    unpaidVat: 0,
     profitBeforeVat: 0,
-    cashAfterVat: 0
+    cashAfterVat: 0,
+    fundBase: 0
   };
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -8365,7 +8519,7 @@ function buildTrendContext_(monthlyRows, workingCapitalRows) {
       netCash: rows[i].netCash,
       turnoverNet: rows[i].turnoverNet,
       profitBeforeVat: rows[i].profitBeforeVat,
-      cashAfterVat: rows[i].cashAfterVat,
+      cashAfterVat: rows[i].cashAfterVat || rows[i].fundBase || 0,
       workingCapital: wc
     });
   }
@@ -8562,7 +8716,7 @@ function renderDashboardTopKpis_(sheet, ctx) {
     { title: 'Виплата Amazon', key: 'payout', value: source.payout || 0, prev: comp.payout || 0 },
     { title: 'Чистий кеш', key: 'netCash', value: source.netCash || 0, prev: comp.netCash || 0 },
     { title: 'Прибуток до НДС', key: 'profitBeforeVat', value: source.profitBeforeVat || 0, prev: comp.profitBeforeVat || 0 },
-    { title: 'Залишок після НДС', key: 'cashAfterVat', value: source.cashAfterVat || 0, prev: comp.cashAfterVat || 0 },
+    { title: 'База для фондів', key: 'fundBase', value: source.fundBase || source.cashAfterVat || 0, prev: comp.fundBase || comp.cashAfterVat || 0 },
     { title: 'VAT до доплати', key: 'vatToPay', value: source.vatToPay || 0, prev: comp.vatToPay || 0 },
     { title: 'Повний оборотний капітал', key: 'workingCapital', value: wcCurrent, prev: wcPrev }
   ];
@@ -8628,7 +8782,7 @@ function renderDashboardDeclaredIncomeBlock_(sheet, ctx) {
     ['ПДВ з продажів', source.vatSales || 0],
     ['Оборот з ПДВ', source.turnoverGross || roundMoney_((source.turnoverNet || 0) + (source.vatSales || 0))],
     ['Прибуток до НДС', source.profitBeforeVat || 0],
-    ['Залишок після НДС', source.cashAfterVat || 0],
+    ['База для фондів', source.fundBase || source.cashAfterVat || 0],
     ['COGS', source.cogs || 0],
     ['Комісії Amazon', source.amazonFees || 0],
     ['Ручні витрати', source.manualExpenses || 0]
@@ -8648,13 +8802,15 @@ function renderDashboardVatBlock_(sheet, ctx) {
     ['ПДВ у комісіях Amazon', source.vatFeeAmazon || 0],
     ['ПДВ з витрат', source.vatExpense || 0],
     ['VAT до заліку', source.vatCredit || 0],
-    ['VAT до доплати', source.vatToPay || 0]
+    ['VAT до доплати', source.vatToPay || 0],
+    ['Фактично сплачений VAT', source.paidVatActual || 0],
+    ['Несплачений VAT', source.unpaidVat || 0]
   ];
   sheet.getRange(startRow + 1, col, 1, 2).setValues([['Показник', 'Сума']]).setFontWeight('bold').setBackground('#fff2f2');
   sheet.getRange(startRow + 2, col, vatRows.length, 2).setValues(vatRows);
   safeSetNumberFormat_(sheet.getRange(startRow + 2, col + 1, vatRows.length, 1), '€#,##0.00', [], 'dashboard.vat');
 
-  sheet.getRange(startRow + 8, col, 1, 5).merge().setValue('Підсумок VAT (' + ctx.viewMode + '): нараховано ' + roundMoney_(source.vatSales || 0).toFixed(2) + ' €, до доплати ' + roundMoney_(source.vatToPay || 0).toFixed(2) + ' €').setBackground('#fff8f8').setFontWeight('bold');
+  sheet.getRange(startRow + 10, col, 1, 5).merge().setValue('Підсумок VAT (' + ctx.viewMode + '): до доплати ' + roundMoney_(source.vatToPay || 0).toFixed(2) + ' €, сплачено ' + roundMoney_(source.paidVatActual || 0).toFixed(2) + ' €, несплачено ' + roundMoney_(source.unpaidVat || 0).toFixed(2) + ' €.').setBackground('#fff8f8').setFontWeight('bold');
 }
 
 function renderDashboardWorkingCapitalBlock_(sheet, ctx) {
@@ -8697,8 +8853,9 @@ function renderDashboardFundsBlock_(sheet, ctx) {
   const source = ctx.kpiSource || {};
   const startRow = 54;
   const rules = getDashboardFundAllocationRules_();
-  const fundBase = roundMoney_(source.cashAfterVat || 0);
+  const fundBase = roundMoney_(source.fundBase || source.cashAfterVat || 0);
   const cogs = roundMoney_(source.cogs || 0);
+  const unpaidVat = roundMoney_(source.unpaidVat || 0);
 
   const allocations = {
     reinvestProfit: roundMoney_(fundBase * 0.75),
@@ -8713,7 +8870,7 @@ function renderDashboardFundsBlock_(sheet, ctx) {
   const salarySpent = roundMoney_(spentBucket['Зарплата (7%)'] || 0);
   const otherSpent = roundMoney_(spentBucket['Інше (6%)'] || 0);
 
-  const reinvestAllocated = roundMoney_(cogs + allocations.reinvestProfit);
+  const reinvestAllocated = roundMoney_(cogs + allocations.reinvestProfit + unpaidVat);
   const fundRows = [
     ['Реінвест', reinvestAllocated, reinvestSpent, roundMoney_(reinvestAllocated - reinvestSpent)],
     ['Бізнес витрати', allocations.business, businessSpent, roundMoney_(allocations.business - businessSpent)],
@@ -8728,7 +8885,7 @@ function renderDashboardFundsBlock_(sheet, ctx) {
   for (let i = 0; i < fundRows.length; i++) {
     if (fundRows[i][3] < 0) sheet.getRange(startRow + 2 + i, 4).setFontColor('#b71c1c').setBackground('#fdeaea').setFontWeight('bold');
   }
-  sheet.getRange(startRow + 7, 1, 1, 8).merge().setValue('Реінвест із прибутку: 75%; Повний фонд реінвесту = COGS + Реінвест із прибутку.').setBackground('#faf7ff').setFontColor('#3949ab');
+  sheet.getRange(startRow + 7, 1, 1, 8).merge().setValue('Фонди: база = Прибуток до НДС - Фактично сплачений VAT; unpaid VAT тимчасово входить у Реінвест.').setBackground('#faf7ff').setFontColor('#3949ab');
 }
 
 function renderDashboardTrendBlock_(sheet, ctx) {
@@ -8737,7 +8894,7 @@ function renderDashboardTrendBlock_(sheet, ctx) {
   sheet.getRange(startRow, 1, 1, 8).merge().setValue('ТРЕНДИ (повна історія)');
   sheet.getRange(startRow, 1, 1, 8).setFontWeight('bold').setFontSize(13).setBackground('#e7f7f6');
 
-  const header = ['Місяць', 'Чистий кеш', 'Оборот без ПДВ', 'Прибуток до НДС', 'Залишок після НДС', 'Повний оборотний капітал'];
+  const header = ['Місяць', 'Чистий кеш', 'Оборот без ПДВ', 'Прибуток до НДС', 'База для фондів', 'Повний оборотний капітал'];
   sheet.getRange(startRow + 1, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#f2fcfb');
 
   const body = rows.map(function(r) {
