@@ -8998,3 +8998,546 @@ function onEdit(e) {
 function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
   return;
 }
+
+/* =========================
+ * DASHBOARD MODERN OVERRIDES
+ * ========================= */
+
+function rebuildDashboard_() {
+  const startMs = new Date().getTime();
+  const ss = SpreadsheetApp.getActive();
+  const source = ss.getSheetByName(CONFIG.MONTHLY_SHEET);
+  if (!source) throw new Error('Не знайдено лист: ' + CONFIG.MONTHLY_SHEET);
+
+  const dashboard = ensureDashboardSheet_();
+  const monthlyData = readMonthlyDashboardRows_(source);
+  const monthlyRows = (monthlyData.rows || []).slice().sort(function(a, b) {
+    return a.month < b.month ? -1 : (a.month > b.month ? 1 : 0);
+  });
+  const months = getAvailableMonthsFromMonthlyReport_(source);
+  const manualByCategory = collectManualExpenseCategoryTotalsReadOnly_();
+  const workingCapitalAgg = collectWorkingCapitalByMonth_();
+  const workingCapitalTotals = getWorkingCapitalTotals_(workingCapitalAgg);
+  const warnings = []
+    .concat(monthlyData.warnings || [])
+    .concat((manualByCategory && manualByCategory.warnings) || [])
+    .concat((workingCapitalAgg && workingCapitalAgg.warnings) || []);
+
+  const preservedState = preserveDashboardControlsState_(dashboard);
+  const controls = readDashboardControls_(dashboard);
+  const resolvedMode = resolveDashboardViewMode_(controls);
+  const resolvedMonth = resolveDashboardMonthSelection_(controls, months);
+  ensureDashboardControls_(dashboard, months, resolvedMode, resolvedMonth);
+  restoreDashboardControlsState_(dashboard, preservedState);
+  applyDashboardControlsValidation_(dashboard, months);
+
+  const finalControls = getDashboardControlValues_(dashboard);
+  const viewMode = resolveDashboardViewMode_(finalControls);
+  const selectedMonth = resolveDashboardMonthSelection_(finalControls, months);
+  const ctx = buildDashboardContext_(viewMode, selectedMonth, monthlyRows, workingCapitalAgg, {
+    manualByCategoryAgg: manualByCategory,
+    workingCapitalTotals: workingCapitalTotals,
+    warnings: warnings,
+    monthlyReadStats: monthlyData.stats || {}
+  });
+
+  clearDashboardBodyKeepControls_(dashboard);
+  const chartCleanupSuccess = clearManagedDashboardCharts_(dashboard);
+  if (!ctx.monthlyRows.length) {
+    renderEmptyDashboard_(dashboard);
+    renderDashboardModernLayout_(dashboard, ctx);
+    applyDashboardModernFormatting_(dashboard);
+    ctx.diagnostics = {
+      chartCleanupSuccess: chartCleanupSuccess,
+      chartBuildSuccess: false,
+      renderedKpis: 0,
+      renderedCharts: 0,
+      renderedSections: 1,
+      formattingSkips: 0,
+      durationMs: new Date().getTime() - startMs
+    };
+    logDashboardDiagnostics_(ctx);
+    return { empty: true, months: 0, latestMonth: '', selectedMonth: selectedMonth, mode: viewMode };
+  }
+
+  renderDashboardForContext_(dashboard, ctx);
+  renderDashboardModernLayout_(dashboard, ctx);
+  applyDashboardModernFormatting_(dashboard);
+  ctx.diagnostics = ctx.diagnostics || {};
+  ctx.diagnostics.chartCleanupSuccess = chartCleanupSuccess;
+  ctx.diagnostics.durationMs = new Date().getTime() - startMs;
+  logDashboardDiagnostics_(ctx);
+
+  return {
+    empty: false,
+    months: ctx.monthlyRows.length,
+    latestMonth: ctx.latestMonth || '',
+    selectedMonth: ctx.selectedMonth || '',
+    mode: ctx.viewMode
+  };
+}
+
+function clearDashboardBodyKeepControls_(sheet) {
+  if (!sheet) return;
+  const cfg = getDashboardControlConfig_();
+  const maxRows = Math.max(sheet.getMaxRows(), 320);
+  const maxCols = Math.max(sheet.getMaxColumns(), 40);
+  if (maxRows >= cfg.bodyStartRow) {
+    safeRunSheetMutation_('dashboard.clearBody', function() {
+      sheet.getRange(cfg.bodyStartRow, 1, maxRows - cfg.bodyStartRow + 1, maxCols).clearContent().clearFormat().clearNote();
+      try { sheet.getRange(cfg.bodyStartRow, 1, maxRows - cfg.bodyStartRow + 1, maxCols).breakApart(); } catch (e) {}
+    });
+  }
+}
+
+function clearManagedDashboardCharts_(sheet) {
+  try {
+    const charts = sheet.getCharts();
+    for (let i = 0; i < charts.length; i++) {
+      try { sheet.removeChart(charts[i]); } catch (e) {}
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function renderDashboardForContext_(sheet, ctx) {
+  ctx.diagnostics = ctx.diagnostics || {};
+  ctx.diagnostics.renderedSections = 0;
+  ctx.diagnostics.renderedKpis = 0;
+  ctx.diagnostics.renderedCharts = 0;
+
+  renderDashboardHeader_(sheet, ctx);
+  renderDashboardModernLayout_(sheet, ctx);
+  renderDashboardTopKpis_(sheet, ctx);
+  renderDashboardChartsArea_(sheet, ctx);
+  renderDashboardSummaryPanels_(sheet, ctx);
+  renderDashboardFundsArea_(sheet, ctx);
+  renderDashboardTrendTable_(sheet, ctx);
+
+  ctx.diagnostics.renderedSections = 6;
+}
+
+function renderEmptyDashboard_(sheet) {
+  const cfg = getDashboardControlConfig_();
+  sheet.getRange(cfg.bodyStartRow, 1, 3, 12).merge().setValue('Немає даних у листі ' + CONFIG.MONTHLY_SHEET + '. Спочатку сформуйте місячний звіт.')
+    .setFontColor('#b71c1c').setFontWeight('bold').setFontSize(13).setBackground('#fff5f5').setHorizontalAlignment('center');
+}
+
+function renderDashboardHeader_(sheet, ctx) {
+  const updated = Utilities.formatDate(ctx.generatedAt, CONFIG.TZ, 'yyyy-MM-dd HH:mm:ss');
+  sheet.getRange('A5:L5').merge().setValue('EXECUTIVE FINANCE DASHBOARD').setFontWeight('bold').setFontSize(15)
+    .setBackground('#0f172a').setFontColor('#ffffff').setHorizontalAlignment('left');
+  const line = 'Оновлено: ' + updated + '   |   Режим: ' + ctx.viewMode + '   |   Обраний: ' + (ctx.selectedMonth || '-') +
+    '   |   Останній: ' + (ctx.latestMonth || '-') + '   |   Місяців: ' + ((ctx.months || []).length || 0);
+  sheet.getRange('A6:L6').merge().setValue(line).setBackground('#eef2ff').setFontColor('#1e293b').setFontWeight('bold');
+}
+
+function renderDashboardTopKpis_(sheet, ctx) {
+  const source = ctx.kpiSource || {};
+  const comp = ctx.viewMode === 'Весь період' ? (ctx.cumulativeCtx.latest || {}) : (ctx.selectedCtx.previous || {});
+  const wcCurrent = (ctx.active && ctx.active.wcSnapshot) ? Number(ctx.active.wcSnapshot.workingCapital || 0) : 0;
+  const wcPrev = (ctx.active && ctx.active.wcPreviousSnapshot) ? Number(ctx.active.wcPreviousSnapshot.workingCapital || 0) : 0;
+
+  const cards = [
+    { title: 'Виплата Amazon', key: 'payout', value: source.payout || 0, prev: comp.payout || 0, note: 'Net payout від Amazon' },
+    { title: 'Чистий кеш', key: 'netCash', value: source.netCash || 0, prev: comp.netCash || 0, note: 'Після COGS та витрат' },
+    { title: 'Прибуток до НДС', key: 'profitBeforeVat', value: source.profitBeforeVat || 0, prev: comp.profitBeforeVat || 0, note: 'Core operating profit' },
+    { title: 'База для фондів', key: 'fundBase', value: source.fundBase || source.cashAfterVat || 0, prev: comp.fundBase || comp.cashAfterVat || 0, note: 'Після фактично сплаченого VAT' },
+    { title: 'VAT до доплати', key: 'vatToPay', value: source.vatToPay || 0, prev: comp.vatToPay || 0, note: 'Tax liability статус' },
+    { title: 'Повний оборотний капітал', key: 'workingCapital', value: wcCurrent, prev: wcPrev, note: 'Ліквідність + інвентар' }
+  ];
+
+  const startRow = 8;
+  const rowHeight = 5;
+  const colPairs = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12]];
+
+  for (let i = 0; i < cards.length; i++) {
+    const cols = colPairs[i];
+    const c1 = cols[0];
+    const delta = calculateDelta_(cards[i].value, cards[i].prev);
+    const titleBg = '#f8fafc';
+    const bodyBg = '#ffffff';
+    const cardRange = sheet.getRange(startRow, c1, rowHeight, 2);
+    cardRange.setBackground(bodyBg).setBorder(true, true, true, true, false, false, '#dbe2ea', SpreadsheetApp.BorderStyle.SOLID);
+
+    sheet.getRange(startRow, c1, 1, 2).merge().setValue(cards[i].title).setFontWeight('bold').setFontSize(10).setBackground(titleBg).setFontColor('#334155');
+    const valueRange = sheet.getRange(startRow + 1, c1, 2, 2).merge().setValue(cards[i].value).setFontWeight('bold').setFontSize(17).setFontColor('#0f172a');
+    safeSetNumberFormat_(valueRange, '€#,##0.00', [], 'dashboard.modern.kpi.' + cards[i].key);
+
+    const subtitle = formatTrendArrow_(delta) + ' ' + formatMoneyCompact_(delta) + ' (' + formatPercentCompact_(calculateDeltaPercent_(cards[i].value, cards[i].prev)) + ')';
+    sheet.getRange(startRow + 3, c1, 1, 2).merge().setValue(subtitle).setFontWeight('bold').setFontColor(colorByDelta_(delta)).setFontSize(10);
+    sheet.getRange(startRow + 4, c1, 1, 2).merge().setValue(cards[i].note).setFontColor('#64748b').setFontSize(8);
+  }
+
+  ctx.diagnostics.renderedKpis = cards.length;
+}
+
+function buildDashboardChartDataRanges_(sheet, ctx) {
+  const dataStartRow = 7;
+  const dataStartCol = 14;
+  const rows = (ctx.monthlyRows || []).slice().sort(function(a, b) { return a.month < b.month ? -1 : (a.month > b.month ? 1 : 0); });
+
+  const headers = [
+    'Month', 'Payout', 'NetCash', 'TurnoverNet', 'ProfitBeforeVAT', 'FundBase', 'VatSales', 'VatCredit', 'VatToPay', 'PaidVat', 'WorkingCapital'
+  ];
+  const values = [headers];
+  for (let i = 0; i < rows.length; i++) {
+    const wc = (ctx.workingCapitalAgg && ctx.workingCapitalAgg.byMonth && ctx.workingCapitalAgg.byMonth[rows[i].month])
+      ? Number(ctx.workingCapitalAgg.byMonth[rows[i].month].workingCapital || 0) : '';
+    values.push([
+      rows[i].month,
+      Number(rows[i].payout || 0),
+      Number(rows[i].netCash || 0),
+      Number(rows[i].turnoverNet || 0),
+      Number(rows[i].profitBeforeVat || 0),
+      Number(rows[i].fundBase || rows[i].cashAfterVat || 0),
+      Number(rows[i].vatSales || 0),
+      Number(rows[i].vatCredit || 0),
+      Number(rows[i].vatToPay || 0),
+      Number(rows[i].paidVatActual || 0),
+      wc
+    ]);
+  }
+
+  const totalRows = Math.max(values.length, 2);
+  const target = sheet.getRange(dataStartRow, dataStartCol, totalRows, headers.length);
+  target.clearContent();
+  sheet.getRange(dataStartRow, dataStartCol, values.length, headers.length).setValues(values);
+  safeSetNumberFormat_(sheet.getRange(dataStartRow + 1, dataStartCol + 1, Math.max(values.length - 1, 1), headers.length - 1), '€#,##0.00', [], 'dashboard.modern.chartdata');
+
+  return {
+    startRow: dataStartRow,
+    startCol: dataStartCol,
+    rowCount: values.length,
+    headers: headers,
+    cashflow: sheet.getRange(dataStartRow, dataStartCol, values.length, 3),
+    income: sheet.getRange(dataStartRow, dataStartCol, values.length, 6),
+    vat: sheet.getRange(dataStartRow, dataStartCol, values.length, 5),
+    workingCapital: sheet.getRange(dataStartRow, dataStartCol, values.length, 2)
+  };
+}
+
+function renderDashboardChartsArea_(sheet, ctx) {
+  const ranges = buildDashboardChartDataRanges_(sheet, ctx);
+  let rendered = 0;
+  if (renderCashflowTrendChart_(sheet, { range: ranges.cashflow, anchorRow: 14, anchorCol: 1 })) rendered++;
+  if (renderIncomeProfitTrendChart_(sheet, { range: ranges.income, anchorRow: 14, anchorCol: 5 })) rendered++;
+  if (renderVatTrendChart_(sheet, { range: ranges.vat, anchorRow: 14, anchorCol: 9 })) rendered++;
+  if (renderWorkingCapitalChart_(sheet, { range: ranges.workingCapital, anchorRow: 30, anchorCol: 9, ctx: ctx })) rendered++;
+  ctx.diagnostics.renderedCharts = rendered;
+}
+
+function renderCashflowTrendChart_(sheet, config) {
+  try {
+    const chart = sheet.newChart()
+      .setChartType(Charts.ChartType.LINE)
+      .addRange(config.range)
+      .setOption('title', 'Cashflow Trend: Виплата Amazon vs Чистий кеш')
+      .setOption('legend', { position: 'bottom' })
+      .setOption('curveType', 'function')
+      .setOption('colors', ['#2563eb', '#16a34a'])
+      .setPosition(config.anchorRow, config.anchorCol, 0, 0)
+      .setOption('width', 520)
+      .setOption('height', 240)
+      .build();
+    sheet.insertChart(chart);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function renderIncomeProfitTrendChart_(sheet, config) {
+  try {
+    const chart = sheet.newChart()
+      .setChartType(Charts.ChartType.LINE)
+      .addRange(config.range)
+      .setOption('title', 'Income/Profit Trend')
+      .setOption('legend', { position: 'bottom' })
+      .setOption('curveType', 'function')
+      .setOption('colors', ['#1d4ed8', '#0891b2', '#7c3aed', '#16a34a', '#0f766e'])
+      .setPosition(config.anchorRow, config.anchorCol, 0, 0)
+      .setOption('width', 520)
+      .setOption('height', 240)
+      .build();
+    sheet.insertChart(chart);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function renderVatTrendChart_(sheet, config) {
+  try {
+    const chart = sheet.newChart()
+      .setChartType(Charts.ChartType.COLUMN)
+      .addRange(config.range)
+      .setOption('title', 'VAT Status Trend')
+      .setOption('isStacked', false)
+      .setOption('legend', { position: 'bottom' })
+      .setOption('colors', ['#dc2626', '#f59e0b', '#7c2d12', '#059669'])
+      .setPosition(config.anchorRow, config.anchorCol, 0, 0)
+      .setOption('width', 520)
+      .setOption('height', 240)
+      .build();
+    sheet.insertChart(chart);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function renderWorkingCapitalChart_(sheet, config) {
+  try {
+    const hasHistory = !!(config.ctx && config.ctx.workingCapitalAgg && config.ctx.workingCapitalAgg.months && config.ctx.workingCapitalAgg.months.length > 1);
+    if (!hasHistory) return false;
+    const chart = sheet.newChart()
+      .setChartType(Charts.ChartType.LINE)
+      .addRange(config.range)
+      .setOption('title', 'Working Capital Trend')
+      .setOption('legend', { position: 'none' })
+      .setOption('colors', ['#f97316'])
+      .setPosition(config.anchorRow, config.anchorCol, 0, 0)
+      .setOption('width', 520)
+      .setOption('height', 220)
+      .build();
+    sheet.insertChart(chart);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function renderDashboardSummaryPanels_(sheet, ctx) {
+  const source = ctx.kpiSource || {};
+  const wc = (ctx.active && ctx.active.wcSnapshot) ? ctx.active.wcSnapshot : null;
+
+  const blocks = [
+    {
+      title: 'Кешфлоу', startCol: 1, bg: '#eff6ff', rows: [
+        ['Виплата Amazon', source.payout || 0],
+        ['COGS', source.cogs || 0],
+        ['Ручні витрати', source.manualExpenses || 0],
+        ['Чистий кеш', source.netCash || 0]
+      ]
+    },
+    {
+      title: 'Декларований дохід', startCol: 4, bg: '#ecfeff', rows: [
+        ['Оборот без ПДВ', source.turnoverNet || 0],
+        ['Прибуток до НДС', source.profitBeforeVat || 0],
+        ['База для фондів', source.fundBase || source.cashAfterVat || 0],
+        ['Комісії Amazon', source.amazonFees || 0]
+      ]
+    },
+    {
+      title: 'VAT', startCol: 7, bg: '#fef2f2', rows: [
+        ['ПДВ з продажів', source.vatSales || 0],
+        ['VAT до заліку', source.vatCredit || 0],
+        ['VAT до доплати', source.vatToPay || 0],
+        ['Фактично сплачений VAT', source.paidVatActual || 0],
+        ['Несплачений VAT', source.unpaidVat || 0]
+      ]
+    },
+    {
+      title: 'Оборотний капітал', startCol: 10, bg: '#fff7ed', rows: [
+        ['Товар на Amazon', wc ? wc.cogsAmazon : 0],
+        ['Доступно до виводу', wc ? wc.amazonPayoutAvailable : 0],
+        ['Товар до відправки', wc ? wc.goodsReadyToShip : 0],
+        ['Кеш', wc ? wc.cashOnHand : 0],
+        ['Кредит', wc ? wc.creditCapacity : 0],
+        ['Повний оборотний капітал', wc ? wc.workingCapital : 0]
+      ]
+    }
+  ];
+
+  const startRow = 30;
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const width = 3;
+    const height = Math.max(b.rows.length + 2, 7);
+    sheet.getRange(startRow, b.startCol, height, width).setBackground('#ffffff').setBorder(true, true, true, true, false, false, '#dbe2ea', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(startRow, b.startCol, 1, width).merge().setValue(b.title).setFontWeight('bold').setFontColor('#0f172a').setBackground(b.bg);
+    sheet.getRange(startRow + 1, b.startCol, 1, width).setValues([['Показник', 'Сума', 'Тренд']]).setFontWeight('bold').setBackground('#f8fafc');
+
+    const values = [];
+    for (let r = 0; r < b.rows.length; r++) {
+      const prev = r > 0 ? b.rows[r - 1][1] : 0;
+      const delta = calculateDelta_(b.rows[r][1], prev);
+      values.push([b.rows[r][0], b.rows[r][1], formatTrendArrow_(delta)]);
+    }
+    sheet.getRange(startRow + 2, b.startCol, values.length, width).setValues(values);
+    safeSetNumberFormat_(sheet.getRange(startRow + 2, b.startCol + 1, values.length, 1), '€#,##0.00', [], 'dashboard.modern.summary');
+    sheet.getRange(startRow + 2, b.startCol + 2, values.length, 1).setHorizontalAlignment('center').setFontWeight('bold');
+  }
+}
+
+function renderDashboardFundsArea_(sheet, ctx) {
+  const source = ctx.kpiSource || {};
+  const startRow = 41;
+  const fundBase = roundMoney_(source.fundBase || source.cashAfterVat || 0);
+  const cogs = roundMoney_(source.cogs || 0);
+  const unpaidVat = roundMoney_(source.unpaidVat || 0);
+  const reinvestFromProfit = roundMoney_(fundBase * 0.75);
+  const business = roundMoney_(fundBase * 0.12);
+  const salary = roundMoney_(fundBase * 0.07);
+  const other = roundMoney_(fundBase * 0.06);
+  const fullReinvest = roundMoney_(cogs + reinvestFromProfit + unpaidVat);
+
+  const spentBucket = ctx.viewMode === 'Весь період' ? ctx.manualTotals : ((ctx.manualCurrent && ctx.manualCurrent.categories) ? ctx.manualCurrent.categories : buildManualExpenseFundCategoryTotalsSkeleton_());
+  const rows = [
+    ['Реінвест', fullReinvest, roundMoney_(spentBucket['Реінвест (75%)'] || 0)],
+    ['Бізнес витрати', business, roundMoney_(spentBucket['Бізнес витрати (12%)'] || 0)],
+    ['Зарплата', salary, roundMoney_(spentBucket['Зарплата (7%)'] || 0)],
+    ['Інше', other, roundMoney_(spentBucket['Інше (6%)'] || 0)]
+  ];
+
+  sheet.getRange(startRow, 1, 9, 7).setBackground('#ffffff').setBorder(true, true, true, true, false, false, '#dbe2ea', SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(startRow, 1, 1, 7).merge().setValue('FUNDS & ALLOCATION').setFontWeight('bold').setBackground('#eef2ff');
+  sheet.getRange(startRow + 1, 1, 1, 4).setValues([['Категорія', 'Виділено', 'Витрачено', 'Залишок']]).setFontWeight('bold').setBackground('#f8fafc');
+
+  const fundValues = rows.map(function(r) { return [r[0], r[1], r[2], roundMoney_(r[1] - r[2])]; });
+  sheet.getRange(startRow + 2, 1, fundValues.length, 4).setValues(fundValues);
+  safeSetNumberFormat_(sheet.getRange(startRow + 2, 2, fundValues.length, 3), '€#,##0.00', [], 'dashboard.modern.funds');
+
+  for (let i = 0; i < fundValues.length; i++) {
+    const allocated = Number(fundValues[i][1] || 0);
+    const spent = Number(fundValues[i][2] || 0);
+    const ratio = allocated > 0 ? Math.min(1, Math.max(0, spent / allocated)) : 0;
+    const cell = sheet.getRange(startRow + 2 + i, 5);
+    cell.setFormula('=SPARKLINE({' + ratio.toFixed(4) + ',1-' + ratio.toFixed(4) + '},{"charttype","bar";"max",1;"color1","#2563eb";"color2","#e2e8f0"})');
+  }
+  sheet.getRange(startRow + 1, 5).setValue('Використання').setFontWeight('bold').setBackground('#f8fafc');
+
+  sheet.getRange(startRow, 8, 9, 5).setBackground('#ffffff').setBorder(true, true, true, true, false, false, '#dbe2ea', SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(startRow, 8, 1, 5).merge().setValue('REINVEST POWER').setFontWeight('bold').setBackground('#ecfdf5');
+  const reinvestRows = [
+    ['COGS', cogs],
+    ['Реінвест із прибутку', reinvestFromProfit],
+    ['Несплачений VAT', unpaidVat],
+    ['Повний фонд реінвесту', fullReinvest]
+  ];
+  sheet.getRange(startRow + 1, 8, 1, 2).setValues([['Компонент', 'Сума']]).setFontWeight('bold').setBackground('#f8fafc');
+  sheet.getRange(startRow + 2, 8, reinvestRows.length, 2).setValues(reinvestRows);
+  safeSetNumberFormat_(sheet.getRange(startRow + 2, 9, reinvestRows.length, 1), '€#,##0.00', [], 'dashboard.modern.reinvest');
+  sheet.getRange(startRow + 7, 8, 2, 5).merge().setValue('Повний фонд реінвесту = COGS + реінвест із прибутку + несплачений VAT').setFontWeight('bold').setFontColor('#166534').setBackground('#f0fdf4');
+}
+
+function renderDashboardTrendTable_(sheet, ctx) {
+  const startRow = 52;
+  const rows = (ctx.monthlyRows || []).slice().sort(function(a, b) { return a.month < b.month ? -1 : (a.month > b.month ? 1 : 0); });
+  const recent = rows.slice(Math.max(0, rows.length - 12));
+  const header = ['Місяць', 'Виплата Amazon', 'Чистий кеш', 'Оборот без ПДВ', 'Прибуток до НДС', 'База для фондів', 'Повний фонд реінвесту', 'Тренд кеш'];
+
+  sheet.getRange(startRow, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#e2e8f0');
+  const body = [];
+  for (let i = 0; i < recent.length; i++) {
+    const fullReinvest = roundMoney_(Number(recent[i].cogs || 0) + Number(recent[i].reinvestFromProfit || (recent[i].fundBase || 0) * 0.75) + Number(recent[i].unpaidVat || 0));
+    body.push([
+      recent[i].month,
+      recent[i].payout || 0,
+      recent[i].netCash || 0,
+      recent[i].turnoverNet || 0,
+      recent[i].profitBeforeVat || 0,
+      recent[i].fundBase || recent[i].cashAfterVat || 0,
+      fullReinvest,
+      ''
+    ]);
+  }
+  if (body.length) {
+    sheet.getRange(startRow + 1, 1, body.length, header.length).setValues(body);
+    safeSetNumberFormat_(sheet.getRange(startRow + 1, 2, body.length, 6), '€#,##0.00', [], 'dashboard.modern.trend');
+    for (let i = 0; i < body.length; i++) {
+      const v = Number(body[i][2] || 0);
+      const abs = Math.max(Math.abs(v), 1);
+      sheet.getRange(startRow + 1 + i, 8).setFormula('=SPARKLINE({' + (v >= 0 ? v : 0) + ',' + (v < 0 ? Math.abs(v) : 0) + '},{"charttype","bar";"max",' + abs + ';"color1","#16a34a";"color2","#dc2626"})');
+    }
+  }
+}
+
+function renderDashboardTrendBlock_(sheet, ctx) {
+  renderDashboardTrendTable_(sheet, ctx);
+}
+
+function renderDashboardFundsBlock_(sheet, ctx) {
+  renderDashboardFundsArea_(sheet, ctx);
+}
+
+function renderDashboardCashflowBlock_(sheet, ctx) {
+  renderDashboardSummaryPanels_(sheet, ctx);
+}
+
+function renderDashboardDeclaredIncomeBlock_(sheet, ctx) {
+  return;
+}
+
+function renderDashboardVatBlock_(sheet, ctx) {
+  return;
+}
+
+function renderDashboardWorkingCapitalBlock_(sheet, ctx) {
+  return;
+}
+
+function renderDashboardModernLayout_(sheet, ctx) {
+  safeRunSheetMutation_('dashboard.modern.layout', function() {
+    const widths = [180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 24, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90];
+    for (let c = 0; c < widths.length; c++) {
+      try { sheet.setColumnWidth(c + 1, widths[c]); } catch (e) {}
+    }
+    sheet.setFrozenRows(6);
+    sheet.setHiddenGridlines(true);
+    try { sheet.hideColumns(14, 11); } catch (e) {}
+  });
+}
+
+function applyDashboardModernFormatting_(sheet) {
+  safeRunSheetMutation_('dashboard.modern.formatting', function() {
+    const lastRow = Math.max(sheet.getLastRow(), 80);
+    const lastCol = Math.max(sheet.getLastColumn(), 12);
+    const range = sheet.getRange(1, 1, lastRow, lastCol);
+    range.setFontFamily('Inter').setVerticalAlignment('middle').setHorizontalAlignment('left');
+    range.setBorder(false, false, false, false, false, false);
+  });
+}
+
+function applyDashboardLayout_(sheet) {
+  renderDashboardModernLayout_(sheet, {});
+}
+
+function applyDashboardFormatting_(sheet) {
+  applyDashboardModernFormatting_(sheet);
+}
+
+function logDashboardDiagnostics_(ctx) {
+  const d = ctx.diagnostics || {};
+  const message = [
+    'selected mode=' + (ctx.viewMode || '-'),
+    'selected month=' + (ctx.selectedMonth || '-'),
+    'cumulative mode=' + (ctx.viewMode === 'Весь період' ? 'yes' : 'no'),
+    'kpi cards rendered=' + Number(d.renderedKpis || 0),
+    'charts rendered=' + Number(d.renderedCharts || 0),
+    'sections rendered=' + Number(d.renderedSections || 0),
+    'chart cleanup success=' + (d.chartCleanupSuccess ? 'yes' : 'no'),
+    'chart rebuild success=' + (Number(d.renderedCharts || 0) > 0 ? 'yes' : 'partial/no'),
+    'formatting skips=' + Number(d.formattingSkips || 0),
+    'render duration ms=' + Number(d.durationMs || 0),
+    'source summary: monthlyValid=' + Number((ctx.monthlyReadStats && ctx.monthlyReadStats.validRows) || 0) +
+      ', warnings=' + ((ctx.warnings || []).length || 0)
+  ].join('; ');
+
+  Logger.log('[DASHBOARD][MODERN] ' + message);
+  appendDiagnosticsLog_({
+    level: 'INFO',
+    operation: 'rebuildDashboard_',
+    sheetName: CONFIG.DASHBOARD_SHEET,
+    warningType: 'DASHBOARD_REBUILD',
+    month: ctx.selectedMonth || '',
+    message: message
+  });
+}
+
+function renderDashboardCharts_(sheet, rows, workingCapitalAgg) {
+  return;
+}
